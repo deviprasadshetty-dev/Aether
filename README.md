@@ -17,6 +17,10 @@ Aether is an MCP (Model Context Protocol) server + Chrome Extension that gives A
 | 💫 **Click Ripples** | Blue ripple animation at click coordinates |
 | 🔄 **Smart Port Reuse** | Auto-kills stale servers — no manual process management |
 | 🔌 **Auto-Reconnect** | Extension reconnects automatically with exponential backoff |
+| 🛡️ **Network Control** | Block ads, images, and trackers for 10x speed |
+| 📱 **Mobile Emulation** | Simulate iPhone/Android viewports and user agents |
+| 💉 **Script Injection** | Inject stealth scripts before page load |
+| 🧠 **Accessibility Tree** | Semantic page view for better agent understanding |
 
 ---
 
@@ -41,7 +45,7 @@ Aether is an MCP (Model Context Protocol) server + Chrome Extension that gives A
 │  │ CDP Commands   │ │
 │  │ Visual Overlay │ │
 │  └────────────────┘ │
-└─────────────────────┘
+└─── Network/Fetch ───┘
 ```
 
 ---
@@ -86,25 +90,31 @@ The AI agent now has access to these tools:
 
 ## 🛠️ MCP Tools
 
-| Tool | Description | Parameters |
-|---|---|---|
-| `navigate` | Navigate to a URL | `url: string` |
-| `get_state` | Get screenshot + interactive elements | — |
-| `click` | Click at coordinates | `x: number, y: number` |
-| `click_element` | Click element by ID (preferred) | `id: number` |
-| `type` | Type text with native key events | `text: string` |
-| `scroll` | Scroll the page | `x: number, y: number` |
-| `evaluate` | Execute JavaScript in the page | `script: string` |
+Aether simplifies browser automation into a single, intuitive interface for your AI agent.
 
-### Example Workflow
+### ⚡ The `act` Tool
+One tool to rule them all. Instead of juggling 20 different tool definitions, Aether provides a unified `act()` capability that handles:
 
-```
-1. navigate("https://google.com")
-2. get_state()             → returns screenshot + elements with IDs
-3. click_element(3)        → clicks the search input (ID 3)
-4. type("AI browser control")
-5. click_element(4)        → clicks the search button
-```
+*   **Navigation**: Go to any URL.
+*   **Interaction**: Click, type, scroll, and drag with human-like input.
+*   **State Analysis**: Retrieve screenshots, accessibility trees, and logs in one go.
+*   **Tab Management**: Create, switch, and close tabs effortlessly.
+
+---
+
+## ⚡ Advanced Capabilities
+
+### 🛡️ Active Network Control
+Block ads, trackers, and heavy media to speed up automation 10x. Aether lets you define exactly what resources to load.
+
+### 📱 Device Emulation & Stealth
+Impersonate mobile devices (iPhone/Android) or modify your User Agent to access simplified layouts and avoid detection.
+
+### 🧠 Deep Accessibility Understanding
+Unlike basic HTML dumps, Aether reads the browser's internal Accessibility Tree to understand the *semantics* of a page—just like a screen reader, but for AI.
+
+### 💉 Script Injection
+Inject custom JavaScript *before* page load to modify the environment or add helper functions seamlessly.
 
 ---
 

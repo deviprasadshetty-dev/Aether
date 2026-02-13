@@ -1,4 +1,4 @@
-// MCP Browser Controller — Agent Visual Overlay
+// Aether — AI Browser Controller — Agent Visual Overlay
 // Provides visual feedback when the AI agent is controlling the browser
 
 (function () {
@@ -96,6 +96,10 @@
                 animation: mcp-cursor-blink 1.5s ease-in-out infinite;
             }
 
+            #mcp-badge-text {
+                transition: opacity 0.2s ease;
+            }
+
             .mcp-click-ripple {
                 position: fixed;
                 width: 24px;
@@ -151,7 +155,7 @@
         if (!badgeEl) {
             badgeEl = document.createElement("div");
             badgeEl.id = "mcp-agent-badge";
-            badgeEl.innerHTML = '<span class="mcp-dot"></span> Agent Controlled';
+            badgeEl.innerHTML = '<span class="mcp-dot"></span> <span id="mcp-badge-text">Agent Controlled</span>';
             document.body.appendChild(badgeEl);
         }
 
@@ -165,6 +169,21 @@
         overlayActive = false;
         if (borderEl) borderEl.classList.remove("active");
         if (badgeEl) badgeEl.classList.remove("active");
+        // Reset badge text
+        const textEl = document.getElementById("mcp-badge-text");
+        if (textEl) textEl.textContent = "Agent Controlled";
+    }
+
+    function updateBadgeStatus(text) {
+        showOverlay();
+        const textEl = document.getElementById("mcp-badge-text");
+        if (textEl) {
+            textEl.style.opacity = "0";
+            setTimeout(() => {
+                textEl.textContent = text || "Agent Controlled";
+                textEl.style.opacity = "1";
+            }, 150);
+        }
     }
 
     function showClickRipple(x, y) {
@@ -208,6 +227,9 @@
             case "show_type":
                 showOverlay();
                 showTypeIndicator(msg.x || 400, msg.y || 300);
+                break;
+            case "update_status":
+                updateBadgeStatus(msg.text);
                 break;
         }
     });
