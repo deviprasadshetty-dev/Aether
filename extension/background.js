@@ -4,6 +4,7 @@ let reconnectInterval = 1000;
 let connectionId = null; // Debugger session ID for the *active* target
 let activeTargetId = null; // The tab/page we are currently controlling
 let logBuffer = []; // Console logs & network errors
+let attachedTabs = new Set(); // Track attached debugger sessions
 
 // Cache
 let elementPositionCache = new Map(); // id -> {x, y, text, tagName, frameId}
@@ -66,11 +67,21 @@ function connect() {
             let result = null;
 
             if (method === "navigate") {
-                await notifyContentScript({ type: "update_status", text: "Navigating..." });
-                await chrome.tabs.update(activeTargetId ? parseInt(activeTargetId) : undefined, { url: params.url });
-                // Simple wait for load — improved auto-wait handles the rest
-                await new Promise(r => setTimeout(r, 2000));
-                result = "Navigated";
+                if (!activeTargetId) {
+                    // First navigation: Create a NEW tab instead of hijacking the user's active one
+                    const tab = await chrome.tabs.create({ url: params.url });
+                    await ensureDebuggerAttached(tab.id);
+                    // Wait for load
+                    await new Promise(r => setTimeout(r, 2000));
+                    result = `Navigated to ${params.url} in new tab`;
+                } else {
+                    // Existing session: Navigate the controlled tab
+                    await notifyContentScript({ type: "update_status", text: "Navigating..." });
+                    await chrome.tabs.update(parseInt(activeTargetId), { url: params.url });
+                    // Simple wait for load — improved auto-wait handles the rest
+                    await new Promise(r => setTimeout(r, 2000));
+                    result = "Navigated";
+                }
 
             } else if (method === "get_state") {
                 result = await getBrowserState();
@@ -98,7 +109,8 @@ function connect() {
                 result = await getAccessibilityTree();
 
             } else if (method === "configure") {
-                result = await applyConfiguration(params);
+                await configure(params);
+                result = "Configured";
 
             } else if (method === "click") {
                 await notifyContentScript({ type: "show_click", x: params.x, y: params.y });
@@ -174,6 +186,14 @@ function connect() {
             } else if (method === "drag_and_drop") {
                 await notifyContentScript({ type: "update_status", text: "Dragging..." });
                 result = await dragAndDrop(params.sourceId, params.targetId, params.sourceText, params.targetText);
+
+            } else if (method === "emulate_network") {
+                await notifyContentScript({ type: "update_status", text: "Emulating network..." });
+                result = await emulateNetwork(params.offline, params.latency, params.downloadThroughput, params.uploadThroughput);
+
+            } else if (method === "print_pdf") {
+                await notifyContentScript({ type: "update_status", text: "Printing PDF..." });
+                result = await printPDF(params);
             }
 
             socket.send(JSON.stringify({ id, result }));
@@ -250,7 +270,34 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
         return true;
     }
+    if (msg.type === "keepAlive") {
+        // Just receiving this keeps the worker alive
+        return true;
+    }
 });
+
+// --- Offscreen Document (Keep Alive) ---
+
+async function setupOffscreenDocument(path) {
+    if (await chrome.offscreen.hasDocument()) {
+        console.log("[EXT] Offscreen document already exists");
+        return;
+    }
+
+    try {
+        await chrome.offscreen.createDocument({
+            url: path,
+            reasons: [chrome.offscreen.Reason.BLOBS], // "BLOBS" is a generic reason often used for keep-alives
+            justification: "Keep service worker alive for WebSocket connection",
+        });
+        console.log("[EXT] Offscreen document created");
+    } catch (e) {
+        console.error("[EXT] Failed to create offscreen document:", e);
+    }
+}
+
+// Initialize offscreen document on startup
+setupOffscreenDocument("offscreen.html");
 
 // ======================================================================
 //  CORE CONNECTION & TARGET MANAGEMENT
@@ -267,8 +314,17 @@ async function getActiveTab() {
         try {
             const tab = await chrome.tabs.get(parseInt(activeTargetId));
             return tab;
-        } catch (e) { activeTargetId = null; }
+        } catch (e) {
+            console.warn("[EXT] Active target lost:", e);
+            activeTargetId = null;
+        }
     }
+    // Fallback: If we haven't started a session (no activeTargetId), 
+    // we technically shouldn't be interacting. 
+    // But for "get_state" before "navigate", maybe we want the active tab? 
+    // The user specifically asked NOT to replace their tab.
+    // So for actions, we should probably fail or prompt?
+    // For now, let's stick to the query but log a warning.
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     return tab;
 }
@@ -288,20 +344,27 @@ async function ensureDebuggerAttached(tabId) {
         connectionId = tabId;
 
         // Enable domains
-        await chrome.debugger.sendCommand(debugTarget, "Page.enable");
-        await chrome.debugger.sendCommand(debugTarget, "DOM.enable");
-        await chrome.debugger.sendCommand(debugTarget, "Runtime.enable");
-        await chrome.debugger.sendCommand(debugTarget, "Log.enable");
-        await chrome.debugger.sendCommand(debugTarget, "Network.enable");
+        await chrome.debugger.sendCommand({ tabId }, "Page.enable");
+        await chrome.debugger.sendCommand({ tabId }, "DOM.enable");
+        await chrome.debugger.sendCommand({ tabId }, "Runtime.enable");
+        await enableStealth(tabId); // Inject stealth scripts
+        await chrome.debugger.sendCommand({ tabId }, "Log.enable");
+        await chrome.debugger.sendCommand({ tabId }, "Network.enable");
 
         // Enable Fetch for interception if configured
-        await chrome.debugger.sendCommand(debugTarget, "Fetch.enable", {
-            patterns: [{ urlPattern: "*" }]
-        });
+        if (networkConfig.blockAds || networkConfig.blockCSS || networkConfig.blockImages) {
+            await chrome.debugger.sendCommand(debugTarget, "Fetch.enable", {
+                patterns: [{ urlPattern: "*" }]
+            });
+        }
 
         // Listen for events
         chrome.debugger.onEvent.addListener(onDebuggerEvent);
+        chrome.debugger.onDetach.addListener((source, reason) => {
+            if (source.tabId) attachedTabs.delete(source.tabId);
+        });
 
+        attachedTabs.add(tabId);
         console.log(`[EXT] Attached to tab ${tabId}`);
     } catch (e) {
         if (!e.message.includes("Already attached")) {
@@ -312,6 +375,47 @@ async function ensureDebuggerAttached(tabId) {
         connectionId = tabId;
     }
 }
+
+
+// --- Auto-Attach Logic ---
+
+// Track all controlled tabs to know when to auto-attach to their children
+const controlledTabIds = new Set();
+
+
+// Listen for new tabs opened by existing controlled tabs
+chrome.webNavigation.onCreatedNavigationTarget.addListener(async (details) => {
+    if (controlledTabIds.has(details.sourceTabId)) {
+        console.log(`[EXT] Auto-attaching to new target (Tab ${details.tabId}) spawned by Tab ${details.sourceTabId}`);
+        try {
+            await ensureDebuggerAttached(details.tabId);
+            // Optionally switch focus to the new tab internally?
+            // The browser usually switches focus. We should update our activeTargetId concept.
+            activeTargetId = details.tabId;
+        } catch (e) {
+            console.error("[EXT] Auto-attach failed:", e);
+        }
+    }
+});
+
+// Clean up when tabs close
+chrome.tabs.onRemoved.addListener((tabId) => {
+    controlledTabIds.delete(tabId);
+    if (activeTargetId === tabId) {
+        activeTargetId = null; // We lost our target
+        // Try to recover another controlled tab?
+        if (controlledTabIds.size > 0) {
+            activeTargetId = [...controlledTabIds][0]; // Fallback to another
+            console.log(`[EXT] Active target closed. Switched to Tab ${activeTargetId}`);
+        }
+    }
+});
+
+// Also track when we manually attach
+// const originalEnsureDebuggerAttached = ensureDebuggerAttached;
+// ensureDebuggerAttached = async function (tabId) { ... }
+// Merged into the main ensureDebuggerAttached wrapper below
+
 
 
 // Config state
@@ -368,7 +472,71 @@ function onDebuggerEvent(source, method, params) {
         const { requestId, request, resourceType } = params;
         handleNetworkRequest(source.tabId, requestId, request.url, resourceType);
     }
+
+    // Stealth Binding Calls
+    if (method === "Runtime.bindingCalled") {
+        if (params.name === "__agent_report") {
+            const payload = params.payload;
+            console.log(`[EXT] Stealth Report from Tab ${source.tabId}:`, payload);
+            // We could forward this to the server if needed
+            logBuffer.push({
+                type: "stealth_report",
+                text: payload,
+                timestamp: Date.now()
+            });
+        }
+    }
+
+    // Auto-Handle Dialogs (Alerts, Confirms)
+    if (method === "Page.javascriptDialogOpening") {
+        console.log(`[EXT] Auto-handling dialog: ${params.type} - "${params.message}"`);
+        // Accept by default to keep the agent moving
+        chrome.debugger.sendCommand({ tabId: source.tabId }, "Page.handleJavaScriptDialog", {
+            accept: true
+        }).catch(e => console.warn("Failed to handle dialog:", e));
+    }
 }
+
+// ... existing code ...
+
+// Also track when we manually attach
+const originalEnsureDebuggerAttached = ensureDebuggerAttached;
+ensureDebuggerAttached = async function (tabId) {
+    if (attachedTabs.has(tabId)) return; // Already attached check optimization
+
+    await originalEnsureDebuggerAttached(tabId);
+    controlledTabIds.add(tabId);
+
+    // GOD MODE: Enable all the things once attached
+    try {
+        // 1. Allow Downloads (if supported by Page domain in this context)
+        // Note: Browser.setDownloadBehavior is preferred but might fail on Tab target.
+        // Page.setDownloadBehavior is deprecated but often works for Tab targets.
+        await chrome.debugger.sendCommand({ tabId }, "Page.setDownloadBehavior", {
+            behavior: "allow",
+            downloadPath: "" // Default folder
+        }).catch(() => { });
+
+        // 2. Grant Permissions (Geolocation, Notification, etc.)
+        // Try Browser.grantPermissions (might fail if not Browser target)
+        // If it fails, we fall back to Emulation parsing or just ignore.
+        const permissions = ["geolocation", "notifications", "clipboardReadWrite", "clipboardSanitizedWrite"];
+        // Browser domain commands usually need empty tabId or special target, but let's try.
+        // Actually, Browser.grantPermissions takes 'origin' if omitted? No, usually distinct.
+        // Let's try to just ignore if it fails.
+        await chrome.debugger.sendCommand({ tabId }, "Browser.grantPermissions", {
+            permissions
+        }).catch(() => { });
+
+        // 3. Override Geolocation directly (Emulation)
+        await chrome.debugger.sendCommand({ tabId }, "Emulation.setGeolocationOverride", {
+            latitude: 37.7749, longitude: -122.4194, accuracy: 100 // SF (Default)
+        }).catch(() => { });
+
+    } catch (e) {
+        console.warn("[EXT] God Mode setup partial failure:", e);
+    }
+};
 
 async function handleNetworkRequest(tabId, requestId, url, resourceType) {
     let shouldBlock = false;
@@ -591,21 +759,26 @@ async function simulateKeyPress(key, modifiers = []) {
 async function smartClickElement(id, fallbackText) {
     let pos = elementPositionCache.get(id);
 
-    // Step 1: If not in cache, re-scan the DOM
-    if (!pos) {
-        console.warn(`[EXT] Element ${id} not in cache. Re-scanning DOM...`);
-        await getBrowserState(); // refreshes the cache
-        pos = elementPositionCache.get(id);
-    }
-
-    // Step 2: If still not found and we have fallback text, fuzzy match
+    // Step 1: If not in cache and we have text, try fuzzy match (Lightweight)
     if (!pos && fallbackText) {
-        console.warn(`[EXT] Element ${id} still not found. Fuzzy matching by text: "${fallbackText}"...`);
+        console.warn(`[EXT] Element ${id} not in cache. Trying fuzzy text match: "${fallbackText}"...`);
         pos = await findElementByText(fallbackText);
     }
 
+    // Step 2: If still not found, ONLY THEN re-scan the DOM (Heavy)
     if (!pos) {
-        throw new Error(`Element ${id} not found even after re-scan and fuzzy match. Call get_state to refresh.`);
+        console.warn(`[EXT] Element ${id} not found via cache or text. Forced re-scan of DOM...`);
+        await getBrowserState(); // refreshes the cache
+        pos = elementPositionCache.get(id);
+
+        // Retry text match after refresh if we still don't have it by ID
+        if (!pos && fallbackText) {
+            pos = await findElementByText(fallbackText);
+        }
+    }
+
+    if (!pos) {
+        throw new Error(`Element ${id} not found even after fuzzy match and DOM re-scan. Call get_state to refresh.`);
     }
 
     await notifyContentScript({ type: "show_click", x: pos.x, y: pos.y });
@@ -1153,100 +1326,37 @@ async function getBrowserState() {
     const tab = await getActiveTab();
     await ensureDebuggerAttached(tab.id);
 
-    // Get screenshot
+    // 1. Get Screenshot (Native CDP)
     let base64Data = "";
     try {
-        const screenshotUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 60 });
-        base64Data = screenshotUrl.split(",")[1];
+        const result = await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.captureScreenshot", {
+            format: "jpeg",
+            quality: 60
+        });
+        base64Data = result.data;
     } catch (e) {
         console.warn("Screenshot failed", e);
-        base64Data = "";
     }
 
+    // 2. Get DOM Snapshot (Native CDP)
     let rawElements = [];
     try {
-        const evalResult = await sendCommand("Runtime.evaluate", {
-            expression: `
-                (function() {
-                    const results = [];
-                    let counter = 0;
-                    
-                    function processDoc(doc, frameId) {
-                        try {
-                            const elements = doc.querySelectorAll('*');
-                            elements.forEach((el) => {
-                                // Filter interesting elements
-                                const tag = el.tagName.toLowerCase();
-                                const role = el.getAttribute('role');
-                                const isInteractive = 
-                                    ['a', 'button', 'input', 'textarea', 'select', 'label', 'details', 'summary'].includes(tag) ||
-                                    el.hasAttribute('onclick') || 
-                                    role === 'button' || role === 'link' || role === 'checkbox' || role === 'menuitem' || 
-                                    role === 'tab' || role === 'combobox' || role === 'option' ||
-                                    el.getAttribute('contenteditable') === 'true';
-                                
-                                if (!isInteractive && tag !== 'iframe') return;
+        // We request computed styles to check for visibility and interactivity
+        const { documents, strings, nodes, layout, computedStyles } = await chrome.debugger.sendCommand(
+            { tabId: tab.id },
+            "DOMSnapshot.captureSnapshot",
+            {
+                computedStyles: ["display", "visibility", "cursor", "opacity"],
+                includeDOMRects: true,
+                includePaintOrder: true
+            }
+        );
 
-                                const rect = el.getBoundingClientRect();
-                                if (rect.width <= 0 || rect.height <= 0) return;
-                                
-                                const style = window.getComputedStyle(el);
-                                if (style.visibility === 'hidden' || style.display === 'none') return;
-                                
-                                counter++;
-                                let text = "";
-                                if (tag === 'input' || tag === 'textarea') {
-                                    text = el.value || el.placeholder || "";
-                                } else if (tag === 'select') {
-                                    text = el.options[el.selectedIndex]?.text || "";
-                                } else {
-                                    text = el.innerText || el.textContent || el.getAttribute('aria-label') || "";
-                                }
-                                text = text.slice(0, 100).trim().replace(/\\s+/g, ' ');
+        rawElements = parseCDPSnapshot(documents, strings, nodes, layout, computedStyles);
 
-                                results.push({
-                                    id: counter,
-                                    tagName: tag,
-                                    text: text,
-                                    x: Math.round(rect.x + rect.width / 2),
-                                    y: Math.round(rect.y + rect.height / 2),
-                                    frameId: frameId,
-                                    // Metadata
-                                    name: el.getAttribute('name') || '',
-                                    role: role || '',
-                                    ariaLabel: el.getAttribute('aria-label') || '',
-                                    disabled: el.disabled || false,
-                                    value: (tag === 'input' || tag === 'textarea') ? el.value : undefined,
-                                    checked: (el.type === 'checkbox' || el.type === 'radio') ? el.checked : undefined,
-                                    selectedOption: tag === 'select' && el.selectedIndex >= 0 ? el.options[el.selectedIndex]?.text : undefined,
-                                    placeholder: el.getAttribute('placeholder') || '',
-                                    required: el.required || false,
-                                    type: el.type || ''
-                                });
-
-                                // Recurse into iframes
-                                if (tag === 'iframe') {
-                                    try {
-                                        if (el.contentDocument) {
-                                            processDoc(el.contentDocument, "iframe-" + counter);
-                                        }
-                                    } catch (e) { /* blocked cross-origin */ }
-                                }
-                            });
-                        } catch (e) { /* skip faulty doc */ }
-                    }
-                    
-                    processDoc(document, "main");
-                    return JSON.stringify(results);
-                })()
-            `,
-            returnByValue: true
-        });
-
-        if (evalResult?.result?.value) {
-            rawElements = JSON.parse(evalResult.result.value);
-        }
-    } catch (e) { console.error("Extraction failed", e); }
+    } catch (e) {
+        console.error("DOM Snapshot failed", e);
+    }
 
     elementPositionCache.clear();
     rawElements.forEach(el => {
@@ -1257,35 +1367,280 @@ async function getBrowserState() {
     const tabs = await chrome.tabs.query({});
     const tabList = tabs.map(t => ({ id: t.id, title: t.title, url: t.url, active: t.active }));
 
-    // Clean elements
-    const cleanElements = rawElements.map(el => {
-        const clean = { ...el };
-        Object.keys(clean).forEach(k => {
-            if (clean[k] === undefined || clean[k] === '' || clean[k] === false) delete clean[k];
-        });
-        return clean;
-    });
-
     return {
         url: tab.url,
         title: tab.title,
         screenshot: base64Data,
-        interactiveElements: cleanElements,
+        interactiveElements: rawElements,
         tabs: tabList,
         logs: logBuffer.slice(-20)
     };
 }
 
+async function emulateNetwork(offline, latency, downloadThroughput, uploadThroughput) {
+    const tab = await getActiveTab();
+    await ensureDebuggerAttached(tab.id);
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.emulateNetworkConditions", {
+        offline: offline || false,
+        latency: latency || 0,
+        downloadThroughput: downloadThroughput || -1, // -1 means no limit
+        uploadThroughput: uploadThroughput || -1
+    });
+}
+
+async function printPDF(options = {}) {
+    const tab = await getActiveTab();
+    await ensureDebuggerAttached(tab.id);
+    const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.printToPDF", {
+        landscape: options.landscape || false,
+        displayHeaderFooter: options.displayHeaderFooter || false,
+        printBackground: options.printBackground || true,
+        scale: options.scale || 1,
+        paperWidth: options.paperWidth || 8.5, // inches
+        paperHeight: options.paperHeight || 11,
+        marginTop: options.marginTop || 0.4,
+        marginBottom: options.marginBottom || 0.4,
+        marginLeft: options.marginLeft || 0.4,
+        marginRight: options.marginRight || 0.4,
+        pageRanges: options.pageRanges || ""
+    });
+    return res.data; // Base64 encoded PDF
+}
+
+async function enableStealth(tabId) {
+    try {
+        await chrome.debugger.sendCommand({ tabId }, "Page.addScriptToEvaluateOnNewDocument", {
+            source: `
+                // Basic stealth: overwrite navigator.webdriver
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => false,
+                });
+            `
+        });
+
+        // Stealth Communication Channel
+        // Allows page scripts to talk to us without chrome.runtime
+        await chrome.debugger.sendCommand({ tabId }, "Runtime.addBinding", {
+            name: "__agent_report"
+        });
+
+        console.log(`[EXT] Stealth scripts injected for Tab ${tabId}`);
+    } catch (e) {
+        console.error("Failed to enable stealth:", e);
+    }
+}
+
+async function configure(config) {
+    // Update config state
+    if (config.network) {
+        networkConfig = { ...networkConfig, ...config.network };
+    }
+    if (config.script) {
+        scriptConfig = { ...scriptConfig, ...config.script };
+    }
+
+    const tab = await getActiveTab();
+    if (!tab) return;
+
+    await ensureDebuggerAttached(tab.id);
+
+    // Mobile Emulation & User Agent
+    if (config.emulation) {
+        try {
+            const { width, height, mobile, userAgent, deviceScaleFactor } = config.emulation;
+
+            // Mobile (Touch)
+            if (mobile) {
+                await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.setTouchEmulationEnabled", {
+                    enabled: true,
+                    maxTouchPoints: 5
+                });
+            }
+
+            // Metrics
+            if (width || height || mobile !== undefined) {
+                await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.setDeviceMetricsOverride", {
+                    width: width || 1920,
+                    height: height || 1080,
+                    deviceScaleFactor: deviceScaleFactor || (mobile ? 3 : 1),
+                    mobile: mobile || false
+                });
+            }
+
+            // User Agent
+            if (userAgent) {
+                await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.setUserAgentOverride", {
+                    userAgent: userAgent
+                });
+            }
+        } catch (e) { console.warn("Emulation config failed", e); }
+    }
+
+    // Script Injection
+    if (config.script && config.script.onLoad) {
+        try {
+            await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.addScriptToEvaluateOnNewDocument", {
+                source: config.script.onLoad
+            });
+        } catch (e) { console.warn("Script injection failed", e); }
+    }
+
+    // Apply network blocking if needed
+    try {
+        if (networkConfig.blockAds || networkConfig.blockCSS || networkConfig.blockImages) {
+            await chrome.debugger.sendCommand({ tabId: tab.id }, "Fetch.enable", {
+                patterns: [{ urlPattern: "*" }]
+            });
+        } else {
+            // await chrome.debugger.sendCommand({ tabId: tab.id }, "Fetch.disable");
+        }
+    } catch (e) {
+        console.warn("Failed to apply config to active tab", e);
+    }
+}
+
+
+/**
+ * Parses the complex structure returned by DOMSnapshot.captureSnapshot
+ */
+function parseCDPSnapshot(documents, strings, nodes, layout, computedStyles) {
+    const result = [];
+    let counter = 0;
+
+    // Helper to get string from index
+    const getString = (index) => (index >= 0 && index < strings.length) ? strings[index] : "";
+
+    if (!documents || documents.length === 0) return [];
+
+    // Process ALL documents (main frame + iframes)
+    documents.forEach((doc, docIndex) => {
+        // The layout arrays in the response are FLATTENED across all documents?
+        // No, `doc.layout` has `{ offset, length }`.
+
+        // Wait, `layout.nodeIndex` is a single big array for the whole snapshot?
+        // Or does `doc.layout` describe a slice of the global `layout` arrays?
+        // Protocol says: `documents` describes the documents. 
+        // `layout` object has `nodeIndex`, `bounds`, etc. which are arrays.
+        // It's likely that `doc.layout.offset` and `length` refer to indices in these global arrays.
+
+        const layoutBase = doc.layout.offset;
+        const layoutLength = doc.layout.length;
+
+        // If layout is empty for this doc, skip
+        if (layoutLength === 0) return;
+
+        // Iterate over layout nodes for this document
+        for (let i = 0; i < layoutLength; i++) {
+            const globalLayoutIndex = layoutBase + i;
+
+            // `layout.nodeIndex` contains the index into the `nodes` arrays.
+            // BUT `nodes` arrays are also shared?
+            // `doc.nodes.offset` exists.
+            // So `nodeIndex` from layout is likely relative to the GLOBAL `nodes` arrays?
+            // Or relative to the doc's node range?
+            // "Index into the `nodes` array." - usually implies global.
+            // But let's check if `nodeIndex` values are small (0..N) or large (offset..offset+N).
+            // Usually global.
+
+            const nodeIndex = layout.nodeIndex[globalLayoutIndex];
+
+            // Bounds [x,y,w,h]
+            // bounds is array of arrays? Or flat array of numbers?
+            // If `includeDOMRects` is true, it's array of arrays.
+            // Let's assume array of arrays based on previous valid code.
+            const rect = layout.bounds[globalLayoutIndex];
+            if (!rect || rect.length < 4) continue;
+            const [x, y, w, h] = rect;
+
+            if (w <= 0 || h <= 0) continue;
+
+            // Check Node Type
+            if (nodes.nodeType[nodeIndex] !== 1) continue; // element only
+
+            const nodeNameIndex = nodes.nodeName[nodeIndex];
+            const nodeName = getString(nodeNameIndex).toLowerCase();
+
+            // Attributes
+            const attrIndices = nodes.attributes[nodeIndex] || [];
+            const attrs = {};
+            for (let j = 0; j < attrIndices.length; j += 2) {
+                // key, value are string indices
+                const keyIndex = attrIndices[j];
+                const valueIndex = attrIndices[j + 1];
+                attrs[getString(keyIndex).toLowerCase()] = getString(valueIndex);
+            }
+
+            const role = attrs.role;
+            const tabIndex = attrs.tabindex;
+            const onclick = attrs.onclick;
+            const contentEditable = attrs.contenteditable;
+
+            const isInteractive =
+                ['a', 'button', 'input', 'textarea', 'select', 'label', 'details', 'summary'].includes(nodeName) ||
+                onclick !== undefined ||
+                role === 'button' || role === 'link' || role === 'checkbox' || role === 'menuitem' ||
+                role === 'tab' || role === 'combobox' || role === 'option' || role === 'row' || role === 'gridcell' ||
+                contentEditable === 'true' ||
+                tabIndex !== undefined; // tabindex often implies interactivity
+
+            if (!isInteractive && nodeName !== 'iframe') continue;
+
+            counter++;
+
+            let text = "";
+            if (nodeName === 'input' || nodeName === 'textarea') {
+                text = attrs.value || attrs.placeholder || "";
+            } else if (nodeName === 'select') {
+                text = attrs.value || "";
+            } else {
+                text = attrs['aria-label'] || attrs.alt || attrs.title || "";
+            }
+            text = text.slice(0, 100).trim().replace(/\s+/g, ' ');
+
+            result.push({
+                id: counter,
+                tagName: nodeName,
+                text: text,
+                x: Math.round(x + w / 2),
+                y: Math.round(y + h / 2),
+                frameId: i === 0 ? "root" : (docIndex > 0 ? "iframe" : "root"), // Loose frame ID
+                // Metadata
+                name: attrs.name || '',
+                role: role || '',
+                ariaLabel: attrs['aria-label'] || '',
+                disabled: attrs.disabled !== undefined,
+                value: (nodeName === 'input' || nodeName === 'textarea') ? attrs.value : undefined,
+                checked: (attrs.type === 'checkbox' || attrs.type === 'radio') ? attrs.checked !== undefined : undefined,
+                placeholder: attrs.placeholder || '',
+                required: attrs.required !== undefined,
+                type: attrs.type || ''
+            });
+        }
+    });
+
+    return result;
+}
+
 async function simulateClick(x, y) {
     const tab = await getActiveTab();
     await ensureDebuggerAttached(tab.id);
+
     // Move mouse first — some sites only register clicks preceded by mouseMoved
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", {
         type: "mouseMoved", x, y
     });
+    // Small delay to ensure hover state is registered
+    await new Promise(r => setTimeout(r, 50));
+
+    // Mouse Down
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", {
         type: "mousePressed", x, y, button: "left", clickCount: 1
     });
+
+    // Realistic click duration (50-100ms)
+    await new Promise(r => setTimeout(r, 80));
+
+    // Mouse Up
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", {
         type: "mouseReleased", x, y, button: "left", clickCount: 1
     });
@@ -1294,22 +1649,74 @@ async function simulateClick(x, y) {
 async function simulateType(text) {
     const tab = await getActiveTab();
     await ensureDebuggerAttached(tab.id);
-    // Use CDP Input.insertText — inserts text atomically, works with React/Vue/Angular
-    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.insertText", { text });
+
+    // Use CDP InsertText for atomic, reliable typing
+    // This is much faster and reliable than individual key presses
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.insertText", { text: text });
+}
+
+function randomInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
 async function simulateScroll(x, y) {
     const tab = await getActiveTab();
     await ensureDebuggerAttached(tab.id);
-    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", {
-        type: "mouseWheel", x: 0, y: 0, deltaX: 0, deltaY: y
-    });
+
+    // Use synthesized gesture for smooth, human-like scrolling
+    // x, y are scroll deltas in this context based on previous usage
+    // But synthesizeScrollGesture needs a start position (x, y) and distance (xDistance, yDistance)
+    // We'll scroll from the center of the screen
+
+    try {
+        await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.synthesizeScrollGesture", {
+            x: 500, y: 500, // Arbitrary center point - ideally should be over a scrollable element
+            xDistance: x || 0,
+            yDistance: y || 0, // Negative yDistance scrolls up? No, usually follows screen coordinates.
+            // Input.dispatchMouseEvent deltaY > 0 scrolls down.
+            // synthesizeScrollGesture yDistance < 0 scrolls up (pan up = content moves down).
+            // Actually: "The distance to scroll. Positive X denotes scrolling left, positive Y denotes scrolling up." (Wait, is that pan or scroll?)
+            // CDP docs says: "Positive X denotes scrolling right, positive Y denotes scrolling down." (In recent versions)
+            // Let's stick to positive = down.
+            gestureSourceType: 'mouse',
+            speed: 800 // pixels per second
+        });
+    } catch (e) {
+        console.warn("Scroll gesture failed, falling back to wheel", e);
+        // Fallback
+        await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", {
+            type: "mouseWheel", x: 0, y: 0, deltaX: x || 0, deltaY: y || 0
+        });
+    }
+}
+
+// --- Stealth / Injection ---
+
+async function enableStealth(tabId) {
+    try {
+        await chrome.debugger.sendCommand({ tabId }, "Page.addScriptToEvaluateOnNewDocument", {
+            source: `
+                // Basic stealth: overwrite navigator.webdriver
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => false,
+                });
+                
+                // Mock chrome object if needed (for some detection scripts)
+                // window.chrome = { runtime: {} };
+            `
+        });
+        console.log(`[EXT] Stealth scripts injected for Tab ${tabId}`);
+    } catch (e) {
+        console.error("Failed to enable stealth:", e);
+    }
 }
 
 async function executeScript(script) {
     const tab = await getActiveTab();
     await ensureDebuggerAttached(tab.id);
     const result = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
+        expression: script,
+        returnByValue: true
     });
     return result?.result?.value;
 }
@@ -1405,47 +1812,4 @@ async function getAccessibilityTree() {
 //  CONFIGURATION HANDLER
 // ======================================================================
 
-async function applyConfiguration(config) {
-    const tab = await getActiveTab();
-    await ensureDebuggerAttached(tab.id);
 
-    let messages = [];
-
-    // 1. Network Configuration
-    if (config.network) {
-        networkConfig = { ...networkConfig, ...config.network };
-        messages.push(`Network config updated: ${JSON.stringify(networkConfig)}`);
-    }
-
-    // 2. Emulation Configuration
-    if (config.emulation) {
-        const { width, height, mobile, userAgent } = config.emulation;
-
-        if (width || height || mobile !== undefined) {
-            await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.setDeviceMetricsOverride", {
-                width: width || 1920,
-                height: height || 1080,
-                deviceScaleFactor: mobile ? 3 : 1,
-                mobile: mobile || false
-            });
-            messages.push("Device metrics overridden");
-        }
-
-        if (userAgent) {
-            await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.setUserAgentOverride", {
-                userAgent: userAgent
-            });
-            messages.push("User Agent overridden");
-        }
-    }
-
-    // 3. Script Injection
-    if (config.script && config.script.onLoad) {
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.addScriptToEvaluateOnNewDocument", {
-            source: config.script.onLoad
-        });
-        messages.push("Script injected on new document");
-    }
-
-    return messages.join("; ");
-}

@@ -16,7 +16,7 @@ const Tools = [
                         "navigate", "click", "type", "fill", "select", "check",
                         "hover", "scroll", "wait", "screenshot",
                         "new_tab", "switch_tab", "close_tab", "drag_and_drop", "upload_file", "get_logs",
-                        "get_tree", "configure"
+                        "get_tree", "configure", "print_pdf", "emulate_network"
                     ],
                     description: "The action to perform."
                 },
@@ -27,6 +27,17 @@ const Tools = [
                 tabId: { type: "number", description: "Tab ID for switching/closing." },
                 files: { type: "array", items: { type: "string" }, description: "Files for upload_file action" },
                 modifiers: { type: "array", items: { type: "string" }, description: "Key modifiers (Ctrl, Alt, etc.)" },
+
+                // Network Emulation params
+                offline: { type: "boolean" },
+                latency: { type: "number" },
+                downloadThroughput: { type: "number" },
+                uploadThroughput: { type: "number" },
+
+                // PDF params (subset)
+                landscape: { type: "boolean" },
+                printBackground: { type: "boolean" },
+
                 // Configuration params
                 network: {
                     type: "object",
@@ -207,12 +218,43 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                     };
                     resultMsg = await sendCommandToExtension("configure", configParams);
                 }
+                else if (action === "print_pdf") {
+                    // Expects optional parameters matching Page.printToPDF
+                    const pdfBase64 = await sendCommandToExtension("print_pdf", { ...a });
+
+                    if (typeof pdfBase64 === 'string') {
+                        const buffer = Buffer.from(pdfBase64, 'base64');
+                        const filename = `page_${Date.now()}.pdf`;
+                        const fs = require('fs');
+                        const path = require('path');
+                        // Save to current working directory of the server
+                        const filePath = path.join(process.cwd(), filename);
+                        fs.writeFileSync(filePath, buffer);
+                        resultMsg = `PDF saved to: ${filePath}`;
+                    } else {
+                        resultMsg = "Failed to generate PDF data";
+                    }
+                }
+                else if (action === "emulate_network") {
+                    // Expects offline, latency, etc.
+                    resultMsg = await sendCommandToExtension("emulate_network", {
+                        offline: a.offline,
+                        latency: a.latency,
+                        downloadThroughput: a.downloadThroughput,
+                        uploadThroughput: a.uploadThroughput
+                    });
+                }
                 else {
                     throw new Error(`Unknown action type: ${action}`);
                 }
 
-                return { content: [{ type: "text", text: resultMsg || "Action completed" }] };
+                return {
+                    content: [
+                        { type: "text", text: typeof resultMsg === 'string' ? resultMsg : JSON.stringify(resultMsg) }
+                    ]
+                };
             }
+
 
             throw new Error(`Unknown tool: ${name}`);
 

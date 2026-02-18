@@ -11,8 +11,10 @@ Aether is an MCP (Model Context Protocol) server + Chrome Extension that gives A
 | Feature | Description |
 |---|---|
 | 🎯 **Set-of-Marks** | Interactive elements are assigned unique IDs for precise clicking |
-| 📸 **State Capture** | Screenshots + interactive element list in a single call |
+| 🛡️ **Self-Healing** | Fuzzy text matching + DOM re-scanning if element IDs shift |
+| 📸 **State Capture** | Screenshots, interactive elements, open tabs, and logs in one call |
 | ⌨️ **Native Input** | CDP-powered typing and clicking — not DOM hacks |
+| ⌨️ **Special Keys** | Full support for Enter, Tab, Backspace, Arrows, and Modifiers |
 | 🔵 **Visual Overlay** | Animated blue gradient border + "Agent Controlled" badge |
 | 💫 **Click Ripples** | Blue ripple animation at click coordinates |
 | 🔄 **Smart Port Reuse** | Auto-kills stale servers — no manual process management |
@@ -95,20 +97,37 @@ Aether simplifies browser automation into a single, intuitive interface for your
 ### ⚡ The `act` Tool
 One tool to rule them all. Instead of juggling 20 different tool definitions, Aether provides a unified `act()` capability that handles:
 
-*   **Navigation**: Go to any URL.
-*   **Interaction**: Click, type, scroll, and drag with human-like input.
-*   **State Analysis**: Retrieve screenshots, accessibility trees, and logs in one go.
-*   **Tab Management**: Create, switch, and close tabs effortlessly.
+*   **Navigation**: `navigate`, `new_tab`, `switch_tab`, `close_tab`.
+*   **Interaction**: `click`, `type`, `fill`, `select`, `check`, `hover`, `scroll`, `drag_and_drop`.
+*   **Form Handling**: `fill` (smartly finds and populates inputs), `upload_file`.
+*   **Compound Actions**: 
+    *   `wait`: Wait for a specific CSS selector or text content to appear.
+    *   `emulate_network`: Control offline status, latency, and throughput.
+    *   `print_pdf`: Generate a PDF of the current page with background and landscape options.
+*   **State Analysis**: `get_logs` (console + network), `get_tree` (accessibility tree).
+
+### 📸 The `get_state` Tool
+The primary way agents "see" the page. Returns:
+- **Screenshot**: High-quality JPEG of the active viewport.
+- **Interactive Elements**: A list of clickable/typable elements with unique IDs.
+- **Open Tabs**: List of all browser tabs with titles and active status.
+- **Console Logs**: Recent logs and network errors for debugging.
 
 ---
 
 ## ⚡ Advanced Capabilities
 
+### 🛡️ Self-Healing Interactions
+Aether is resilient to minor UI changes. If an element ID is no longer found, it automatically:
+1. Performs a fuzzy search by text content.
+2. If that fails, it re-scans the entire DOM to refresh the cache.
+3. Attempts to find the element again before reporting an error.
+
 ### 🛡️ Active Network Control
-Block ads, trackers, and heavy media to speed up automation 10x. Aether lets you define exactly what resources to load.
+Block ads, trackers, and heavy media to speed up automation 10x. Aether lets you define exactly what resources to load via the `configure` action or `emulate_network`.
 
 ### 📱 Device Emulation & Stealth
-Impersonate mobile devices (iPhone/Android) or modify your User Agent to access simplified layouts and avoid detection.
+Impersonate mobile devices (iPhone/Android) or modify your User Agent to access simplified layouts and avoid detection. Stealth scripts are injected to bypass basic bot detection measures.
 
 ### 🧠 Deep Accessibility Understanding
 Unlike basic HTML dumps, Aether reads the browser's internal Accessibility Tree to understand the *semantics* of a page—just like a screen reader, but for AI.
