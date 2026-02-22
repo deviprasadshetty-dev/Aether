@@ -2,6 +2,9 @@
 // Provides visual feedback when the AI agent is controlling the browser
 
 (function () {
+    if (window.__aether_agent_overlay_injected) return;
+    window.__aether_agent_overlay_injected = true;
+
     let overlayActive = false;
     let borderEl = null;
     let badgeEl = null;
@@ -148,15 +151,21 @@
         injectStyles();
 
         if (!borderEl) {
-            borderEl = document.createElement("div");
-            borderEl.id = "mcp-agent-border";
-            document.body.appendChild(borderEl);
+            borderEl = document.getElementById("mcp-agent-border");
+            if (!borderEl) {
+                borderEl = document.createElement("div");
+                borderEl.id = "mcp-agent-border";
+                document.body.appendChild(borderEl);
+            }
         }
         if (!badgeEl) {
-            badgeEl = document.createElement("div");
-            badgeEl.id = "mcp-agent-badge";
-            badgeEl.innerHTML = '<span class="mcp-dot"></span> <span id="mcp-badge-text">Agent Controlled</span>';
-            document.body.appendChild(badgeEl);
+            badgeEl = document.getElementById("mcp-agent-badge");
+            if (!badgeEl) {
+                badgeEl = document.createElement("div");
+                badgeEl.id = "mcp-agent-badge";
+                badgeEl.innerHTML = '<span class="mcp-dot"></span> <span id="mcp-badge-text">Agent Controlled</span>';
+                document.body.appendChild(badgeEl);
+            }
         }
 
         requestAnimationFrame(() => {

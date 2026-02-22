@@ -96,6 +96,8 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                         if (el.selectedOption) desc += ` selected="${el.selectedOption}"`;
                         if (el.disabled) desc += ` DISABLED`;
                         if (el.required) desc += ` REQUIRED`;
+                        // Add coordinates for agent awareness
+                        if (el.x && el.y) desc += ` center=(${el.x},${el.y})`;
                         return desc;
                     }).join("\n")
                     : "No elements found";
@@ -126,6 +128,7 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                 console.error(`[MCP] Act: ${action}`, JSON.stringify(a));
 
                 let resultMsg = "";
+                const textFallback = a.selector || (a.value && isNaN(Number(a.value)) ? String(a.value) : "");
 
                 // --- NAVIGATION & TABS ---
                 if (action === "navigate") {
@@ -145,7 +148,7 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                 // --- INTERACTION ---
                 else if (action === "click") {
                     if (a.elementId) {
-                        resultMsg = await sendCommandToExtension("click_element", { id: Number(a.elementId), text: a.text });
+                        resultMsg = await sendCommandToExtension("click_element", { id: Number(a.elementId), text: textFallback });
                     } else if (a.coordinate) {
                         const [x, y] = a.coordinate.split(',').map(Number);
                         await sendCommandToExtension("click", { x, y });
@@ -160,19 +163,19 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                 }
                 else if (action === "fill") {
                     if (!a.elementId) throw new Error("Fill requires elementId");
-                    resultMsg = await sendCommandToExtension("fill_form", { id: Number(a.elementId), value: a.value, text: a.text });
+                    resultMsg = await sendCommandToExtension("fill_form", { id: Number(a.elementId), value: a.value, text: textFallback });
                 }
                 else if (action === "select") {
                     if (!a.elementId) throw new Error("Select requires elementId");
-                    resultMsg = await sendCommandToExtension("select_option", { id: Number(a.elementId), value: a.value, text: a.text });
+                    resultMsg = await sendCommandToExtension("select_option", { id: Number(a.elementId), value: a.value, text: textFallback });
                 }
                 else if (action === "check") {
                     if (!a.elementId) throw new Error("Check requires elementId");
-                    resultMsg = await sendCommandToExtension("set_checkbox", { id: Number(a.elementId), checked: a.value === "true" || a.value === true, text: a.text });
+                    resultMsg = await sendCommandToExtension("set_checkbox", { id: Number(a.elementId), checked: a.value === "true" || a.value === true, text: textFallback });
                 }
                 else if (action === "upload_file") {
                     if (!a.elementId) throw new Error("Upload requires elementId");
-                    resultMsg = await sendCommandToExtension("upload_file", { id: Number(a.elementId), files: a.files, text: a.text });
+                    resultMsg = await sendCommandToExtension("upload_file", { id: Number(a.elementId), files: a.files, text: textFallback });
                 }
                 else if (action === "drag_and_drop") {
                     if (!a.elementId || !a.value) throw new Error("Drag requires elementId (source) and value (targetId)");
@@ -180,7 +183,7 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                 }
                 else if (action === "hover") {
                     if (a.elementId) {
-                        resultMsg = await sendCommandToExtension("hover", { id: Number(a.elementId), text: a.text });
+                        resultMsg = await sendCommandToExtension("hover", { id: Number(a.elementId), text: textFallback });
                     } else if (a.coordinate) {
                         const [x, y] = a.coordinate.split(',').map(Number);
                         resultMsg = await sendCommandToExtension("hover", { x, y });

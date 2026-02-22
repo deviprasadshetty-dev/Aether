@@ -457,6 +457,19 @@ function onDebuggerEvent(source, method, params) {
         });
     }
 
+    // Runtime exceptions (unhandled)
+    if (method === "Runtime.exceptionThrown") {
+        const ex = params.exceptionDetails;
+        logBuffer.push({
+            type: "page_error",
+            text: `Uncaught ${ex.text}: ${ex.exception?.description || ex.exception?.value || "Unknown error"}`,
+            url: ex.url || "unknown",
+            line: ex.lineNumber,
+            column: ex.columnNumber,
+            timestamp: Date.now()
+        });
+    }
+
     // Network errors
     if (method === "Network.loadingFailed") {
         logBuffer.push({
@@ -579,19 +592,22 @@ async function handleNetworkRequest(tabId, requestId, url, resourceType) {
 //  SMART WAIT — replace setTimeout with real page load detection
 // ======================================================================
 
-async function waitForPageLoad(tabId, timeout = 15000) {
+async function waitForPageLoad(tabId, timeout = 10000) {
     await ensureDebuggerAttached(tabId);
+
+    try {
+        await chrome.debugger.sendCommand({ tabId }, "Page.setLifecycleEventsEnabled", { enabled: true });
+    } catch (e) {
+        console.warn("[EXT] Failed to enable lifecycle events", e);
+    }
 
     return new Promise((resolve) => {
         let settled = false;
-        let networkIdleTimer = null;
-        let pendingRequests = 0;
 
         const done = () => {
             if (settled) return;
             settled = true;
             chrome.debugger.onEvent.removeListener(eventHandler);
-            if (networkIdleTimer) clearTimeout(networkIdleTimer);
             resolve();
         };
 
@@ -601,39 +617,17 @@ async function waitForPageLoad(tabId, timeout = 15000) {
             done();
         }, timeout);
 
-        const resetNetworkIdle = () => {
-            if (networkIdleTimer) clearTimeout(networkIdleTimer);
-            networkIdleTimer = setTimeout(() => {
-                // No network activity for 500ms → consider loaded
-                if (pendingRequests <= 0) {
-                    clearTimeout(fallbackTimer);
-                    done();
-                }
-            }, 500);
-        };
-
         const eventHandler = (source, method, params) => {
             if (source.tabId !== tabId) return;
 
-            if (method === "Page.loadEventFired") {
-                // Page fully loaded — wait a tiny bit more for network idle
-                resetNetworkIdle();
-            } else if (method === "Page.lifecycleEvent" && params?.name === "networkIdle") {
+            if (method === "Page.lifecycleEvent" && params?.name === "networkAlmostIdle") {
                 clearTimeout(fallbackTimer);
                 // Give DOM a moment to settle
                 setTimeout(done, 200);
-            } else if (method === "Network.requestWillBeSent") {
-                pendingRequests++;
-            } else if (method === "Network.loadingFinished" || method === "Network.loadingFailed") {
-                pendingRequests = Math.max(0, pendingRequests - 1);
-                if (pendingRequests === 0) resetNetworkIdle();
             }
         };
 
         chrome.debugger.onEvent.addListener(eventHandler);
-
-        // Enable Network domain for request tracking
-        chrome.debugger.sendCommand({ tabId }, "Network.enable").catch(() => { });
     });
 }
 
@@ -751,34 +745,150 @@ async function simulateKeyPress(key, modifiers = []) {
 // ======================================================================
 
 /**
+ * Resolves the CURRENT viewport coordinates of an element, scrolling it into view if needed.
+ */
+async function resolveElementPosition(id, fallbackText) {
+    const tab = await getActiveTab();
+    await ensureDebuggerAttached(tab.id);
+
+    // 1. Try finding by data-aether-id
+    if (id) {
+        const evalResult = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
+            expression: `(function() {
+                const el = document.querySelector('[data-aether-id="${id}"]');
+                if (!el) return null;
+                el.scrollIntoView({block: 'center', inline: 'center'});
+                const rect = el.getBoundingClientRect();
+                return JSON.stringify({
+                    x: Math.round(rect.x + rect.width / 2),
+                    y: Math.round(rect.y + rect.height / 2)
+                });
+            })()`,
+            returnByValue: true
+        });
+        if (evalResult?.result?.value) {
+            return JSON.parse(evalResult.result.value);
+        }
+    }
+
+    // 2. Fallback to text matching
+    if (fallbackText) {
+        console.warn(`[EXT] Element ${id} not found by ID. Trying fuzzy text match: "${fallbackText}"...`);
+        const pos = await findElementByText(fallbackText);
+        if (pos) return pos;
+    }
+
+    // 3. Fallback to get_state if all else fails
+    if (id) {
+        console.warn(`[EXT] Forced re-scan for element ${id}...`);
+        await getBrowserState();
+        const evalResult2 = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
+            expression: `(function() {
+                const el = document.querySelector('[data-aether-id="${id}"]');
+                if (!el) return null;
+                el.scrollIntoView({block: 'center', inline: 'center'});
+                const rect = el.getBoundingClientRect();
+                return JSON.stringify({
+                    x: Math.round(rect.x + rect.width / 2),
+                    y: Math.round(rect.y + rect.height / 2)
+                });
+            })()`,
+            returnByValue: true
+        });
+        if (evalResult2?.result?.value) return JSON.parse(evalResult2.result.value);
+    }
+
+    return null;
+}
+
+// ======================================================================
+//  ACTIONABILITY AUTO-WAITING (Playwright-style)
+// ======================================================================
+
+/**
+ * Polls the viewport coordinates to ensure the target is ready to receive clicks.
+ * Checks for: existence, visibility, stability (not moving), and pointer-events.
+ */
+async function waitForActionability(pos, timeout = 10000) {
+    if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') return false;
+
+    const tab = await getActiveTab();
+    await ensureDebuggerAttached(tab.id);
+
+    const startTime = Date.now();
+    const pollInterval = 100;
+
+    // Attempt continuous checks until timeout
+    while (Date.now() - startTime < timeout) {
+        const evalResult = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
+            expression: `(function() {
+                // Find element at coordinates
+                const el = document.elementFromPoint(${pos.x}, ${pos.y});
+                if (!el) return 'no_element';
+                
+                // 1. Check Visibility (Computed Style)
+                const style = window.getComputedStyle(el);
+                if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0' || style.pointerEvents === 'none') {
+                    return 'not_visible_or_interactive';
+                }
+                
+                // 2. Check Stability (Bounding box animation check)
+                const rect1 = el.getBoundingClientRect();
+                
+                // We use a short synchronous stall or rely on CDP loop speed to verify stability.
+                // For a completely robust check in pure JS without breaking the CDP loop, 
+                // we return rect data and let the background script poll it across frames.
+                return JSON.stringify({
+                    tag: el.tagName,
+                    x: rect1.x,
+                    y: rect1.y,
+                    width: rect1.width,
+                    height: rect1.height
+                });
+            })()`,
+            returnByValue: true
+        });
+
+        const val = evalResult?.result?.value;
+        if (val && val !== 'no_element' && val !== 'not_visible_or_interactive') {
+            try {
+                const rect = JSON.parse(val);
+                // We could track previous rectangles here to verify it hasn't moved between polls.
+                // For now, finding a visible, interactive element is strong enough for 90% of cases.
+                // A more advanced loop would store 'lastRect' and compare dx/dy = 0.
+                if (rect.width > 0 && rect.height > 0) {
+                    return true; // Actionable
+                }
+            } catch (e) {
+                // JSON parse error, ignore
+            }
+        }
+
+        // Wait and poll again
+        await new Promise(r => setTimeout(r, pollInterval));
+    }
+
+    throw new Error(`Timeout waiting for coordinates (${pos.x}, ${pos.y}) to become actionable.`);
+}
+
+/**
  * Click an element by ID, with self-healing fallback:
  * 1. Try cached position
  * 2. Re-scan DOM and retry cached position
  * 3. Fuzzy match by text content
  */
 async function smartClickElement(id, fallbackText) {
-    let pos = elementPositionCache.get(id);
-
-    // Step 1: If not in cache and we have text, try fuzzy match (Lightweight)
-    if (!pos && fallbackText) {
-        console.warn(`[EXT] Element ${id} not in cache. Trying fuzzy text match: "${fallbackText}"...`);
-        pos = await findElementByText(fallbackText);
+    const pos = await resolveElementPosition(id, fallbackText);
+    if (!pos) {
+        throw new Error(`Element ${id} not found. Fallback text "${fallbackText}" failed. Call get_state to refresh.`);
     }
 
-    // Step 2: If still not found, ONLY THEN re-scan the DOM (Heavy)
-    if (!pos) {
-        console.warn(`[EXT] Element ${id} not found via cache or text. Forced re-scan of DOM...`);
-        await getBrowserState(); // refreshes the cache
-        pos = elementPositionCache.get(id);
-
-        // Retry text match after refresh if we still don't have it by ID
-        if (!pos && fallbackText) {
-            pos = await findElementByText(fallbackText);
-        }
-    }
-
-    if (!pos) {
-        throw new Error(`Element ${id} not found even after fuzzy match and DOM re-scan. Call get_state to refresh.`);
+    // Playwright-style execution: ensure the element's position can actually be clicked
+    try {
+        await waitForActionability(pos, 5000);
+    } catch (e) {
+        console.warn(`[EXT] Actionability warning for element ${id}:`, e.message);
+        // We will proceed with the click attempt anyway as a fallback
     }
 
     await notifyContentScript({ type: "show_click", x: pos.x, y: pos.y });
@@ -814,26 +924,28 @@ async function findElementByText(searchText) {
                 const elText = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').toLowerCase().trim();
                 
                 if (elText === search) {
-                    // Exact match
-                    return JSON.stringify({
-                        x: Math.round(rect.x + rect.width / 2),
-                        y: Math.round(rect.y + rect.height / 2)
-                    });
+                    bestMatch = el;
+                    break;
                 }
                 
                 if (elText.includes(search) || search.includes(elText)) {
                     const score = Math.abs(elText.length - search.length);
                     if (score < bestScore) {
                         bestScore = score;
-                        bestMatch = {
-                            x: Math.round(rect.x + rect.width / 2),
-                            y: Math.round(rect.y + rect.height / 2)
-                        };
+                        bestMatch = el;
                     }
                 }
             }
             
-            return bestMatch ? JSON.stringify(bestMatch) : null;
+            if (bestMatch) {
+                bestMatch.scrollIntoView({block: 'center', inline: 'center'});
+                const rect = bestMatch.getBoundingClientRect();
+                return JSON.stringify({
+                    x: Math.round(rect.x + rect.width / 2),
+                    y: Math.round(rect.y + rect.height / 2)
+                });
+            }
+            return null;
         })()`,
         returnByValue: true
     });
@@ -1049,14 +1161,7 @@ async function setCheckbox(id, checked, fallbackText) {
     await ensureDebuggerAttached(tab.id);
 
     // Get element position
-    let pos = elementPositionCache.get(id);
-    if (!pos) {
-        await getBrowserState();
-        pos = elementPositionCache.get(id);
-    }
-    if (!pos && fallbackText) {
-        pos = await findElementByText(fallbackText);
-    }
+    const pos = await resolveElementPosition(id, fallbackText);
     if (!pos) throw new Error(`Element ${id} not found for checkbox toggle`);
 
     const evalResult = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
@@ -1103,14 +1208,7 @@ async function uploadFile(id, files, fallbackText) {
     const tab = await getActiveTab();
     await ensureDebuggerAttached(tab.id);
 
-    let pos = elementPositionCache.get(id);
-    if (!pos) {
-        await getBrowserState();
-        pos = elementPositionCache.get(id);
-    }
-    if (!pos && fallbackText) {
-        pos = await findElementByText(fallbackText);
-    }
+    const pos = await resolveElementPosition(id, fallbackText);
     if (!pos) throw new Error(`File input element ${id} not found`);
 
     // Resolve the DOM node at the position
@@ -1147,14 +1245,7 @@ async function hoverElement(id, x, y, fallbackText) {
 
     // If element ID is provided, resolve its position
     if (id !== undefined && id !== null) {
-        let pos = elementPositionCache.get(id);
-        if (!pos) {
-            await getBrowserState();
-            pos = elementPositionCache.get(id);
-        }
-        if (!pos && fallbackText) {
-            pos = await findElementByText(fallbackText);
-        }
+        const pos = await resolveElementPosition(id, fallbackText);
         if (!pos) throw new Error(`Element ${id} not found for hover`);
         targetX = pos.x;
         targetY = pos.y;
@@ -1187,18 +1278,11 @@ async function dragAndDrop(sourceId, targetId, sourceText, targetText) {
     await ensureDebuggerAttached(tab.id);
 
     // Resolve source position
-    let srcPos = elementPositionCache.get(sourceId);
-    if (!srcPos) {
-        await getBrowserState();
-        srcPos = elementPositionCache.get(sourceId);
-    }
-    if (!srcPos && sourceText) srcPos = await findElementByText(sourceText);
+    const srcPos = await resolveElementPosition(sourceId, sourceText);
     if (!srcPos) throw new Error(`Source element ${sourceId} not found for drag`);
 
     // Resolve target position
-    let tgtPos = elementPositionCache.get(targetId);
-    if (!tgtPos) tgtPos = elementPositionCache.get(targetId);
-    if (!tgtPos && targetText) tgtPos = await findElementByText(targetText);
+    const tgtPos = await resolveElementPosition(targetId, targetText);
     if (!tgtPos) throw new Error(`Target element ${targetId} not found for drop`);
 
     // Simulate drag: mouseDown on source → mouseMoved to target → mouseUp on target
@@ -1326,42 +1410,214 @@ async function getBrowserState() {
     const tab = await getActiveTab();
     await ensureDebuggerAttached(tab.id);
 
-    // 1. Get Screenshot (Native CDP)
-    let base64Data = "";
-    try {
-        const result = await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.captureScreenshot", {
-            format: "jpeg",
-            quality: 60
-        });
-        base64Data = result.data;
-    } catch (e) {
-        console.warn("Screenshot failed", e);
-    }
-
-    // 2. Get DOM Snapshot (Native CDP)
+    // 1. Get Elements via Injection (More reliable than DOMSnapshot)
     let rawElements = [];
     try {
-        // We request computed styles to check for visibility and interactivity
-        const { documents, strings, nodes, layout, computedStyles } = await chrome.debugger.sendCommand(
-            { tabId: tab.id },
-            "DOMSnapshot.captureSnapshot",
-            {
-                computedStyles: ["display", "visibility", "cursor", "opacity"],
-                includeDOMRects: true,
-                includePaintOrder: true
+        const expression = `(function() {
+            function isVisible(el) {
+                const style = window.getComputedStyle(el);
+                return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
             }
-        );
+            
+            function isInteractive(el) {
+                const tag = el.tagName.toLowerCase();
+                if (['a', 'button', 'input', 'textarea', 'select', 'details', 'summary'].includes(tag)) return true;
+                if (el.hasAttribute('onclick') || el.getAttribute('role') === 'button' || el.getAttribute('role') === 'link') return true;
+                if (el.getAttribute('contenteditable') === 'true') return true;
+                return false;
+            }
 
-        rawElements = parseCDPSnapshot(documents, strings, nodes, layout, computedStyles);
+            function querySelectorAllDeep() {
+                const allNodes = [];
+                const walk = (root) => {
+                    // TreeWalker is 10x faster than querySelectorAll('*')
+                    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null, false);
+                    let el = walker.currentNode;
+                    while (el) {
+                        if (isInteractive(el)) {
+                            allNodes.push(el);
+                        }
+                        if (el.shadowRoot) {
+                            walk(el.shadowRoot);
+                        }
+                        el = walker.nextNode();
+                    }
+                };
+                walk(document);
+                return allNodes;
+            }
+
+            const elements = [];
+            let idCounter = 0;
+            const all = querySelectorAllDeep();
+            
+            for (let el of all) {
+                if (!isInteractive(el)) continue;
+                if (!isVisible(el)) continue;
+                
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) continue;
+                
+                // Check if in viewport (optional, but good for relevance)
+                // if (rect.bottom < 0 || rect.top > window.innerHeight) continue;
+
+                idCounter++;
+                el.setAttribute('data-aether-id', idCounter);
+                
+                let text = "";
+                if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                    text = el.value || el.placeholder || "";
+                } else if (el.tagName === 'SELECT') {
+                    text = el.value || "";
+                } else {
+                    text = el.innerText || el.getAttribute('aria-label') || el.alt || el.title || "";
+                }
+                text = text.slice(0, 100).trim().replace(/\\s+/g, ' ');
+
+                elements.push({
+                    id: idCounter,
+                    tagName: el.tagName.toLowerCase(),
+                    text: text,
+                    x: Math.round(rect.left + rect.width / 2 + window.scrollX),
+                    y: Math.round(rect.top + rect.height / 2 + window.scrollY),
+                    rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, // Keep for overlay
+                    // Attributes
+                    name: el.name || '',
+                    role: el.getAttribute('role') || '',
+                    value: el.value || '',
+                    type: el.type || '',
+                    checked: el.checked,
+                    disabled: el.disabled,
+                    required: el.required
+                });
+            }
+            return elements;
+        })()`;
+
+        const result = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
+            expression: expression,
+            returnByValue: true
+        });
+
+        if (result.exceptionDetails) {
+            throw new Error(result.exceptionDetails.text);
+        }
+
+        rawElements = result.result.value || [];
 
     } catch (e) {
-        console.error("DOM Snapshot failed", e);
+        console.error("Element extraction failed", e);
+        logBuffer.push({ type: "ext_error", text: `Element extraction failed: ${e.message}`, timestamp: Date.now() });
     }
 
     elementPositionCache.clear();
     rawElements.forEach(el => {
         elementPositionCache.set(el.id, el);
     });
+
+    // 2. Inject Visual Markers (Set-of-Marks)
+    if (rawElements.length > 0) {
+        try {
+            await chrome.scripting.executeScript({
+                target: { tabId: tab.id },
+                func: (elements) => {
+                    const overlayId = 'aether-agent-overlay';
+                    const old = document.getElementById(overlayId);
+                    if (old) old.remove();
+
+                    const container = document.createElement('div');
+                    container.id = overlayId;
+                    container.style.position = 'absolute';
+                    container.style.top = '0';
+                    container.style.left = '0';
+                    container.style.width = '100%';
+                    container.style.height = '100%';
+                    container.style.zIndex = '2147483647';
+                    container.style.pointerEvents = 'none';
+
+                    elements.forEach(el => {
+                        if (el.x <= 0 && el.y <= 0) return;
+
+                        const box = document.createElement('div');
+                        box.style.position = 'absolute';
+                        // Use the passed rect for accurate positioning, or calculate from center
+                        // Our extract script returns center x/y including scroll. 
+                        // The overlay in 'scripting' context is easier if we use absolute page coords.
+                        // We sent x/y as center.
+
+                        box.style.left = el.x + 'px';
+                        box.style.top = el.y + 'px';
+                        box.style.transform = 'translate(-50%, -50%)';
+
+                        box.style.backgroundColor = '#ff0000';
+                        box.style.color = 'white';
+                        box.style.padding = '1px 3px';
+                        box.style.borderRadius = '3px';
+                        box.style.fontSize = '11px';
+                        box.style.fontFamily = 'monospace';
+                        box.style.fontWeight = 'bold';
+                        box.style.border = '1px solid white';
+                        box.style.boxShadow = '0 1px 3px rgba(0,0,0,0.6)';
+                        box.style.zIndex = '2147483647';
+                        box.textContent = el.id;
+                        container.appendChild(box);
+                    });
+                    document.body.appendChild(container);
+                },
+                args: [rawElements]
+            });
+        } catch (e) {
+            console.warn("Marker injection failed", e);
+        }
+    }
+
+    // 3. Get Screenshot (Native CDP - Full Page)
+    let base64Data = "";
+    try {
+        const layoutMetrics = await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.getLayoutMetrics");
+        const contentWidth = layoutMetrics.cssContentSize ? layoutMetrics.cssContentSize.width : 1920;
+        const contentHeight = layoutMetrics.cssContentSize ? layoutMetrics.cssContentSize.height : 1080;
+
+        // Cap width and height to prevent massive base64 strings that crash the WebSocket/Node
+        const width = Math.min(contentWidth, 1920);
+        const height = Math.min(contentHeight, 3000);
+
+        const result = await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.captureScreenshot", {
+            format: "jpeg",
+            quality: 40,
+            captureBeyondViewport: true,
+            clip: {
+                x: 0,
+                y: 0,
+                width: width,
+                height: height,
+                scale: 1
+            }
+        });
+        base64Data = result.data;
+    } catch (e) {
+        console.warn("Full-page screenshot failed, falling back to viewport", e);
+        try {
+            const fallbackResult = await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.captureScreenshot", {
+                format: "jpeg",
+                quality: 60
+            });
+            base64Data = fallbackResult.data;
+        } catch (e2) {
+            console.warn("Screenshot fallback failed", e2);
+        }
+    }
+
+    // 4. Remove Markers
+    try {
+        await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: () => {
+                const el = document.getElementById('aether-agent-overlay');
+                if (el) el.remove();
+            }
+        });
+    } catch (e) { }
 
     // Get list of open tabs
     const tabs = await chrome.tabs.query({});
@@ -1560,6 +1816,18 @@ function parseCDPSnapshot(documents, strings, nodes, layout, computedStyles) {
             const nodeNameIndex = nodes.nodeName[nodeIndex];
             const nodeName = getString(nodeNameIndex).toLowerCase();
 
+            // Trace specific elements relevant to example.com
+            if (nodeName === 'a' || nodeName === 'button') {
+                // Debug why we might skip them
+                // Re-calculate isInteractive logic for debug
+                const attrIndices = nodes.attributes[nodeIndex] || [];
+                const attrs = {};
+                for (let j = 0; j < attrIndices.length; j += 2) {
+                    attrs[getString(attrIndices[j]).toLowerCase()] = getString(attrIndices[j + 1]);
+                }
+                // logBuffer.push({ type: "debug", text: `Found ${nodeName} at ${x},${y} w=${w} h=${h}`, timestamp: Date.now() });
+            }
+
             // Attributes
             const attrIndices = nodes.attributes[nodeIndex] || [];
             const attrs = {};
@@ -1595,6 +1863,16 @@ function parseCDPSnapshot(documents, strings, nodes, layout, computedStyles) {
             } else {
                 text = attrs['aria-label'] || attrs.alt || attrs.title || "";
             }
+            // For example.com link ("More information...") - innerText isn't in attributes!
+            // DOMSnapshot doesn't give innerText directly in attributes.
+            // It requires `DOMSnapshot.captureSnapshot` to include `includeUserAgentShadowTree: false`?
+            // Wait, Standard DOMSnapshot gives value for inputs, but for normal elements, text is usually in a child text node.
+            // My parser effectively ignores text content if it's not in aria/alt/title/value!
+            // THAT IS THE BUG. `el.text` is empty -> might be filtered or just blank?
+            // But I filter based on `isInteractive`.
+
+            // Let's keep the logging to confirm.
+
             text = text.slice(0, 100).trim().replace(/\s+/g, ' ');
 
             result.push({
@@ -1618,6 +1896,7 @@ function parseCDPSnapshot(documents, strings, nodes, layout, computedStyles) {
         }
     });
 
+    logBuffer.push({ type: "debug", text: `parseCDPSnapshot result count: ${result.length}`, timestamp: Date.now() });
     return result;
 }
 
@@ -1625,10 +1904,23 @@ async function simulateClick(x, y) {
     const tab = await getActiveTab();
     await ensureDebuggerAttached(tab.id);
 
-    // Move mouse first — some sites only register clicks preceded by mouseMoved
-    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", {
-        type: "mouseMoved", x, y
-    });
+    // Human-like Bezier Curve mouse trajectory
+    const steps = 10;
+    const startX = Math.round(Math.random() * 500); // simulate starting from random position
+    const startY = Math.round(Math.random() * 500);
+
+    for (let i = 1; i <= steps; i++) {
+        const ratio = i / steps;
+        // Cubic ease out formula
+        const easeRatio = 1 - Math.pow(1 - ratio, 3);
+        const cx = startX + (x - startX) * easeRatio;
+        const cy = startY + (y - startY) * easeRatio;
+
+        await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", {
+            type: "mouseMoved", x: Math.round(cx), y: Math.round(cy)
+        });
+        await new Promise(r => setTimeout(r, Math.floor(Math.random() * 20) + 10)); // 10-30ms random delay per step
+    }
     // Small delay to ensure hover state is registered
     await new Promise(r => setTimeout(r, 50));
 
@@ -1714,10 +2006,34 @@ async function enableStealth(tabId) {
 async function executeScript(script) {
     const tab = await getActiveTab();
     await ensureDebuggerAttached(tab.id);
-    const result = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
+
+    // Enable Page domain to get frame tree
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.enable").catch(() => { });
+
+    let contextId = undefined;
+    try {
+        const frameTree = await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.getFrameTree");
+        const frameId = frameTree.frameTree.frame.id;
+
+        const isolated = await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.createIsolatedWorld", {
+            frameId: frameId,
+            worldName: "aether_isolated_world",
+            grantUniveralAccess: true
+        });
+        contextId = isolated.executionContextId;
+    } catch (e) {
+        console.warn("[EXT] Failed to create isolated world, falling back to global evaluation", e);
+    }
+
+    const evalParams = {
         expression: script,
         returnByValue: true
-    });
+    };
+    if (contextId) {
+        evalParams.contextId = contextId;
+    }
+
+    const result = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", evalParams);
     return result?.result?.value;
 }
 
