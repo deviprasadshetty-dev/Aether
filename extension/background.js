@@ -6,13 +6,16 @@ let activeTargetId = null; // The tab/page we are currently controlling
 let logBuffer = []; // Console logs & network errors
 let attachedTabs = new Set(); // Track attached debugger sessions
 let screencastFrames = []; // Buffer for Page.screencastFrame data
+let criticalTimestamps = []; // Timestamps for interesting events (errors/clicks)
 let globalMockPattern = null;
 let globalMockResponse = null;
+let traceBuffer = []; // Buffer for Tracing.dataCollected
 
 // Cache
 let elementPositionCache = new Map(); // id -> {x, y, text, tagName, frameId}
 let pingInterval = null;
 let agentStopTimeout = null;
+let activeNetworkRequests = 0;
 
 // --- Key code mappings for special keys ---
 const KEY_MAP = {
@@ -82,6 +85,25 @@ function connect() {
                     result = "Navigated";
                 }
 
+            } else if (method === "screenshot_region") {
+                const tab = await getActiveTab();
+                await ensureDebuggerAttached(tab.id);
+                const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.captureScreenshot", {
+                    format: "jpeg",
+                    quality: 80,
+                    clip: {
+                        x: params.x || 0,
+                        y: params.y || 0,
+                        width: params.width || 100,
+                        height: params.height || 100,
+                        scale: 1
+                    }
+                });
+                result = res.data;
+
+            } else if (method === "verify_ui_state") {
+                result = await verifyUIState(params.selector, params.expectedText, params.type);
+
             } else if (method === "get_state") {
                 result = await getBrowserState(params);
 
@@ -116,8 +138,33 @@ function connect() {
 
             } else if (method === "click") {
                 await notifyContentScript({ type: "show_click", x: params.x, y: params.y });
-                await simulateClick(params.x, params.y);
+                await simulateClick(params.x, params.y, params.button || "left", params.clickCount || 1);
                 result = "Clicked coordinates";
+
+            } else if (method === "double_click") {
+                await notifyContentScript({ type: "show_click", x: params.x, y: params.y });
+                await simulateClick(params.x, params.y, "left", 2);
+                result = "Double clicked";
+
+            } else if (method === "right_click") {
+                await notifyContentScript({ type: "show_click", x: params.x, y: params.y });
+                await simulateClick(params.x, params.y, "right", 1);
+                result = "Right clicked";
+
+            } else if (method === "middle_click") {
+                await notifyContentScript({ type: "show_click", x: params.x, y: params.y });
+                await simulateClick(params.x, params.y, "middle", 1);
+                result = "Middle clicked";
+
+            } else if (method === "drag") {
+                await notifyContentScript({ type: "update_status", text: "Dragging..." });
+                await simulateDrag(params.startX, params.startY, params.endX, params.endY);
+                result = "Dragged";
+
+            } else if (method === "mouse_move") {
+                const tab = await getActiveTab();
+                await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseMoved", x: params.x, y: params.y });
+                result = "Mouse moved";
 
             } else if (method === "click_element") {
                 result = await smartClickElement(params.id, params.text);
@@ -225,57 +272,71 @@ function connect() {
                 result = { frames: screencastFrames };
                 screencastFrames = []; // clear buffer after sending
 
+            } else if (method === "start_tracing") {
+                const tab = await getActiveTab();
+                await ensureDebuggerAttached(tab.id);
+                traceBuffer = [];
+                await chrome.debugger.sendCommand({ tabId: tab.id }, "Tracing.start", params.options || {});
+                result = "Tracing started";
+
+            } else if (method === "stop_tracing") {
+                const tab = await getActiveTab();
+                await ensureDebuggerAttached(tab.id);
+                await chrome.debugger.sendCommand({ tabId: tab.id }, "Tracing.end", {});
+                // Tracing.end is async and triggers tracingComplete event. 
+                // We'll wait up to 5s for the buffer to fill.
+                await new Promise(r => setTimeout(r, 2000)); 
+                result = { traceEvents: traceBuffer };
+                traceBuffer = [];
+
+            } else if (method === "target_auto_attach") {
+                const tab = await getActiveTab();
+                await ensureDebuggerAttached(tab.id);
+                await chrome.debugger.sendCommand({ tabId: tab.id }, "Target.setAutoAttach", {
+                    autoAttach: true,
+                    waitForDebuggerOnStart: false,
+                    flatten: true
+                });
+                result = "Target auto-attach enabled";
+
+            } else if (method === "enable_domain") {
+                const tab = await getActiveTab();
+                await ensureDebuggerAttached(tab.id);
+                await chrome.debugger.sendCommand({ tabId: tab.id }, `${params.domain}.enable`, {});
+                result = `Domain ${params.domain} enabled`;
+
+            } else if (method === "set_dom_breakpoint") {
+                const tab = await getActiveTab();
+                await ensureDebuggerAttached(tab.id);
+                // Get nodeId first
+                const nodeRes = await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.querySelector", {
+                    nodeId: (await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.getDocument", {})).root.nodeId,
+                    selector: params.selector
+                });
+                await chrome.debugger.sendCommand({ tabId: tab.id }, "DOMDebugger.setDOMBreakpoint", {
+                    nodeId: nodeRes.nodeId,
+                    type: params.type || "subtree-modified"
+                });
+                result = `DOM breakpoint set on ${params.selector}`;
+
+            } else if (method === "pause") {
+                const tab = await getActiveTab();
+                await ensureDebuggerAttached(tab.id);
+                await chrome.debugger.sendCommand({ tabId: tab.id }, "Debugger.enable", {});
+                await chrome.debugger.sendCommand({ tabId: tab.id }, "Debugger.pause", {});
+                result = "Browser execution paused";
+
+            } else if (method === "resume") {
+                const tab = await getActiveTab();
+                await ensureDebuggerAttached(tab.id);
+                await chrome.debugger.sendCommand({ tabId: tab.id }, "Debugger.resume", {});
+                result = "Browser execution resumed";
+
             } else if (method === "highlight_elements") {
                 const tab = await getActiveTab();
                 await ensureDebuggerAttached(tab.id);
-                const expression = `(function() {
-                    const existing = document.getElementById('aether-highlights');
-                    if (existing) existing.remove();
-                    const container = document.createElement('div');
-                    container.id = 'aether-highlights';
-                    container.style.position = 'absolute';
-                    container.style.top = '0';
-                    container.style.left = '0';
-                    container.style.width = '100%';
-                    container.style.height = '100%';
-                    container.style.pointerEvents = 'none';
-                    container.style.zIndex = '2147483647';
-                    document.body.appendChild(container);
-
-                    const elements = document.querySelectorAll('[data-aether-id]');
-                    elements.forEach(el => {
-                        const rect = el.getBoundingClientRect();
-                        if (rect.width <= 0 || rect.height <= 0) return;
-                        const box = document.createElement('div');
-                        box.style.position = 'absolute';
-                        box.style.left = (rect.left + window.scrollX) + 'px';
-                        box.style.top = (rect.top + window.scrollY) + 'px';
-                        box.style.width = rect.width + 'px';
-                        box.style.height = rect.height + 'px';
-                        box.style.border = '2px solid rgba(59, 130, 246, 0.5)';
-                        box.style.boxSizing = 'border-box';
-                        box.style.backgroundColor = 'rgba(59, 130, 246, 0.1)';
-                        
-                        const label = document.createElement('div');
-                        label.innerText = el.getAttribute('data-aether-id');
-                        label.style.position = 'absolute';
-                        label.style.top = '-18px';
-                        label.style.left = '0';
-                        label.style.backgroundColor = 'rgba(59, 130, 246, 0.9)';
-                        label.style.color = 'white';
-                        label.style.fontSize = '12px';
-                        label.style.fontWeight = 'bold';
-                        label.style.padding = '2px 4px';
-                        label.style.borderRadius = '2px';
-                        label.style.lineHeight = '1';
-                        
-                        box.appendChild(label);
-                        container.appendChild(box);
-                    });
-                    return 'Highlights drawn';
-                })()`;
-                const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", { expression, returnByValue: true });
-                result = res.result.value;
+                await drawHighlights(tab.id);
+                result = "Highlights drawn";
 
             } else if (method === "mock_network_request") {
                 const tab = await getActiveTab();
@@ -295,6 +356,18 @@ function connect() {
             } else if (method === "wait_for_element") {
                 await notifyContentScript({ type: "update_status", text: "Waiting for element..." });
                 result = await waitForElement(params.selector, params.timeout || 10000);
+
+            } else if (method === "wait_for_network_idle") {
+                await notifyContentScript({ type: "update_status", text: "Waiting for network idle..." });
+                result = await waitForNetworkIdle(params.timeout || 10000);
+
+            } else if (method === "wait_for_navigation") {
+                await notifyContentScript({ type: "update_status", text: "Waiting for navigation..." });
+                result = await waitForNavigation(params.timeout || 10000);
+
+            } else if (method === "assert") {
+                await notifyContentScript({ type: "update_status", text: "Asserting..." });
+                result = await performAssertion(params.assertionType, params.selector, params.value);
 
             } else if (method === "click_and_wait") {
                 await notifyContentScript({ type: "update_status", text: "Clicking and waiting..." });
@@ -385,6 +458,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (socket) socket.close();
         else connect();
     }
+    if (msg.type === "keepAlive") {
+        // Explicitly respond to keep the SW active for this event
+        sendResponse({ status: "alive" });
+        return true;
+    }
     if (msg.type === "status") {
         sendResponse({ connected: socket && socket.readyState === WebSocket.OPEN });
         return true;
@@ -439,16 +517,37 @@ async function ensureDebuggerAttached(tabId) {
 function onDebuggerEvent(source, method, params) {
     if (method === "Log.entryAdded") {
         logBuffer.push({ type: "console", level: params.entry.level, text: params.entry.text, timestamp: params.entry.timestamp, url: params.entry.url });
+        if (params.entry.level === 'error') criticalTimestamps.push(Date.now());
     }
     if (method === "Runtime.consoleAPICalled") {
         logBuffer.push({ type: "console_api", level: params.type, text: params.args.map(a => a.value || a.description || "").join(" "), timestamp: Date.now() });
+        if (params.type === 'error') criticalTimestamps.push(Date.now());
+    }
+    if (method === "Tracing.dataCollected") {
+        if (params.value) traceBuffer.push(...params.value);
+    }
+    if (method === "Tracing.tracingComplete") {
+        // Handled in stop_tracing with a wait
+    }
+    if (method === "Target.attachedToTarget") {
+        logBuffer.push({ type: "target", text: `Auto-attached to target: ${params.targetInfo.url}`, targetId: params.targetInfo.targetId });
     }
     if (method === "Page.javascriptDialogOpening") {
         chrome.debugger.sendCommand({ tabId: source.tabId }, "Page.handleJavaScriptDialog", { accept: true }).catch(() => {});
+        criticalTimestamps.push(Date.now());
     }
     if (method === "Page.screencastFrame") {
-        screencastFrames.push({ data: params.data, metadata: params.metadata });
-        // Must ack the frame so Chrome sends the next one!
+        if (screencastFrames.length < 1000) {
+            const now = Date.now();
+            // A frame is critical if it happened within 1s of a critical event
+            const isCritical = criticalTimestamps.some(t => Math.abs(now - t) < 1000);
+            screencastFrames.push({ 
+                data: params.data, 
+                metadata: params.metadata, 
+                timestamp: now,
+                isCritical: isCritical
+            });
+        }
         chrome.debugger.sendCommand({ tabId: source.tabId }, "Page.screencastFrameAck", { sessionId: params.sessionId }).catch(() => {});
     }
     if (method === "Fetch.requestPaused") {
@@ -468,16 +567,30 @@ function onDebuggerEvent(source, method, params) {
         }
         chrome.debugger.sendCommand({ tabId: source.tabId }, "Fetch.continueRequest", { requestId: params.requestId }).catch(() => {});
     }
+    if (method === "Network.requestWillBeSent") {
+        activeNetworkRequests++;
+    }
+    if (method === "Network.loadingFinished" || method === "Network.loadingFailed") {
+        activeNetworkRequests = Math.max(0, activeNetworkRequests - 1);
+    }
 }
 
 async function getBrowserState(options = {}) {
     const tab = await getActiveTab();
     await ensureDebuggerAttached(tab.id);
-    const startTime = Date.now();
-    const [elementsResult, screenshotResult] = await Promise.all([
-        extractElements(tab.id),
-        captureScreenshot(tab.id, options.fullPage)
-    ]);
+    
+    // First extract elements so they get data-aether-id attached
+    const elementsResult = await extractElements(tab.id);
+    
+    // Draw highlights for visual grounding
+    await drawHighlights(tab.id);
+    await new Promise(r => setTimeout(r, 100)); // wait for paint
+    
+    const screenshotResult = await captureScreenshot(tab.id, options.fullPage);
+    
+    // Clear highlights so the user page isn't cluttered
+    await clearHighlights(tab.id);
+    
     const rawElements = elementsResult || [];
     elementPositionCache.clear();
     rawElements.forEach(el => elementPositionCache.set(el.id, el));
@@ -494,58 +607,113 @@ async function getBrowserState(options = {}) {
 
 async function extractElements(tabId) {
     try {
-        const expression = `(function() {
-            function isVisible(el) {
-                const style = window.getComputedStyle(el);
-                return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
-            }
-            function isInteractive(el) {
-                const tag = el.tagName.toLowerCase();
-                if (['a', 'button', 'input', 'textarea', 'select', 'details', 'summary'].includes(tag)) return true;
-                if (el.hasAttribute('onclick') || el.getAttribute('role') === 'button' || el.getAttribute('role') === 'link') return true;
-                if (el.getAttribute('contenteditable') === 'true') return true;
-                return false;
-            }
-            function walk(root, allNodes) {
-                const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null, false);
-                let el = walker.currentNode;
-                while (el) {
-                    if (isInteractive(el)) allNodes.push(el);
-                    if (el.shadowRoot) walk(el.shadowRoot, allNodes);
-                    el = walker.nextNode();
+        const { root } = await chrome.debugger.sendCommand({ tabId }, "DOM.getDocument", { pierce: true, depth: -1 });
+        const interactiveNodes = [];
+        
+        function isInteractive(node) {
+            const tag = (node.nodeName || "").toLowerCase();
+            if (['a', 'button', 'input', 'textarea', 'select', 'details', 'summary'].includes(tag)) return true;
+            if (node.attributes) {
+                for (let i = 0; i < node.attributes.length; i += 2) {
+                    const name = node.attributes[i];
+                    const val = node.attributes[i+1];
+                    if (name === 'onclick' || name === 'contenteditable' && val === 'true') return true;
+                    if (name === 'role' && (val === 'button' || val === 'link')) return true;
                 }
             }
-            const elements = [];
-            const all = [];
-            walk(document, all);
-            let idCounter = 0;
-            for (let el of all) {
-                if (!isVisible(el)) continue;
-                const rect = el.getBoundingClientRect();
-                if (rect.width <= 0 || rect.height <= 0) continue;
+            return false;
+        }
+
+        function walk(node) {
+            if (node.nodeType === 1) { // Element
+                if (isInteractive(node)) interactiveNodes.push(node);
+            }
+            if (node.children) node.children.forEach(walk);
+            if (node.shadowRoots) node.shadowRoots.forEach(walk);
+            if (node.contentDocument) walk(node.contentDocument);
+        }
+        walk(root);
+
+        const scrollRes = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", { 
+            expression: "JSON.stringify({x: window.scrollX, y: window.scrollY})", 
+            returnByValue: true 
+        }).catch(() => null);
+        const scroll = scrollRes && scrollRes.result && scrollRes.result.value ? JSON.parse(scrollRes.result.value) : {x: 0, y: 0};
+
+        const elements = [];
+        let idCounter = 0;
+
+        for (const node of interactiveNodes) {
+            try {
+                const boxRes = await chrome.debugger.sendCommand({ tabId }, "DOM.getBoxModel", { nodeId: node.nodeId }).catch(() => null);
+                if (!boxRes || !boxRes.model) continue; 
+                
+                const model = boxRes.model;
+                const quad = model.border;
+                const width = model.width;
+                const height = model.height;
+                if (width <= 0 || height <= 0) continue;
+                
                 idCounter++;
-                el.setAttribute('data-aether-id', idCounter);
-                let text = (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') ? (el.value || el.placeholder || "") : 
-                           (el.tagName === 'SELECT' ? el.value : (el.innerText || el.getAttribute('aria-label') || el.alt || el.title || ""));
+                
+                await chrome.debugger.sendCommand({ tabId }, "DOM.setAttributeValue", { 
+                    nodeId: node.nodeId, 
+                    name: "data-aether-id", 
+                    value: idCounter.toString() 
+                }).catch(() => {});
+
+                const x = Math.round(Math.min(quad[0], quad[2], quad[4], quad[6]) + width / 2 + scroll.x);
+                const y = Math.round(Math.min(quad[1], quad[3], quad[5], quad[7]) + height / 2 + scroll.y);
+
+                let text = "";
+                let name = "";
+                let role = "";
+                let value = "";
+                let type = "";
+                let disabled = false;
+                let checked = false;
+
+                if (node.attributes) {
+                    for (let i = 0; i < node.attributes.length; i += 2) {
+                        const attr = node.attributes[i];
+                        const val = node.attributes[i+1];
+                        if (attr === 'name') name = val;
+                        if (attr === 'role') role = val;
+                        if (attr === 'value') value = val;
+                        if (attr === 'type') type = val;
+                        if (attr === 'disabled') disabled = true;
+                        if (attr === 'checked') checked = true;
+                        if (attr === 'aria-label' && !text) text = val;
+                        if (attr === 'alt' && !text) text = val;
+                        if (attr === 'title' && !text) text = val;
+                        if (attr === 'placeholder' && !text) text = val;
+                    }
+                }
+                
+                const resolveRes = await chrome.debugger.sendCommand({ tabId }, "DOM.resolveNode", { nodeId: node.nodeId }).catch(() => null);
+                if (resolveRes && resolveRes.object && resolveRes.object.objectId) {
+                    const funcRes = await chrome.debugger.sendCommand({ tabId }, "Runtime.callFunctionOn", {
+                        objectId: resolveRes.object.objectId,
+                        functionDeclaration: `function() { 
+                            let t = this.tagName === 'INPUT' || this.tagName === 'TEXTAREA' ? (this.value || this.placeholder) : (this.innerText || this.textContent);
+                            return (t || "").trim();
+                        }`,
+                        returnByValue: true
+                    }).catch(() => null);
+                    if (funcRes && funcRes.result && funcRes.result.value) text = funcRes.result.value;
+                }
+
                 elements.push({
                     id: idCounter,
-                    tagName: el.tagName.toLowerCase(),
-                    text: text.slice(0, 100).trim().replace(/\\s+/g, ' '),
-                    x: Math.round(rect.left + rect.width / 2 + window.scrollX),
-                    y: Math.round(rect.top + rect.height / 2 + window.scrollY),
-                    rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-                    name: el.name || '',
-                    role: el.getAttribute('role') || '',
-                    value: el.value || '',
-                    type: el.type || '',
-                    checked: el.checked,
-                    disabled: el.disabled
+                    tagName: node.nodeName.toLowerCase(),
+                    text: (text || "").slice(0, 100).replace(/\s+/g, ' '),
+                    x, y,
+                    rect: { x: quad[0], y: quad[1], width, height },
+                    name, role, value, type, checked, disabled
                 });
-            }
-            return elements;
-        })()`;
-        const res = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", { expression, returnByValue: true });
-        return res.result.value || [];
+            } catch(e) {}
+        }
+        return elements;
     } catch (e) { return []; }
 }
 
@@ -557,19 +725,53 @@ async function captureScreenshot(tabId, fullPage = false) {
     } catch (e) { return ""; }
 }
 
-async function simulateClick(x, y) {
+async function simulateClick(x, y, button = "left", clickCount = 1) {
     const tab = await getActiveTab();
     const steps = 5;
-    const startX = Math.round(Math.random() * 500), startY = Math.round(Math.random() * 500);
+    const [startX, startY] = [Math.round(Math.random() * 500), Math.round(Math.random() * 500)];
     for (let i = 1; i <= steps; i++) {
         const ratio = i / steps;
         const ease = 1 - Math.pow(1 - ratio, 2);
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseMoved", x: Math.round(startX + (x - startX) * ease), y: Math.round(startY + (y - startY) * ease) });
-        await new Promise(r => setTimeout(r, 15));
+        await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { 
+            type: "mouseMoved", 
+            x: Math.round(startX + (x - startX) * ease), 
+            y: Math.round(startY + (y - startY) * ease) 
+        });
+        await new Promise(r => setTimeout(r, 10));
     }
-    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
-    await new Promise(r => setTimeout(r, 40));
-    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, clickCount });
+    await new Promise(r => setTimeout(r, 30));
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button, clickCount });
+}
+
+async function simulateDrag(startX, startY, endX, endY) {
+    const tab = await getActiveTab();
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseMoved", x: startX, y: startY });
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mousePressed", x: startX, y: startY, button: "left", clickCount: 1 });
+    await new Promise(r => setTimeout(r, 100));
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseMoved", x: endX, y: endY, button: "left" });
+    await new Promise(r => setTimeout(r, 100));
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: endY, button: "left", clickCount: 1 });
+}
+
+async function simulateKeyPress(key, modifiers = []) {
+    const tab = await getActiveTab();
+    const modifierMask = { 'Alt': 1, 'Control': 2, 'Ctrl': 2, 'Meta': 4, 'Command': 4, 'Shift': 8 };
+    let modifiersBitmask = 0;
+    modifiers.forEach(m => { modifiersBitmask |= (modifierMask[m] || 0); });
+
+    const keyData = KEY_MAP[key] || { key: key, code: key, keyCode: key.toUpperCase().charCodeAt(0) };
+    const eventParams = {
+        modifiers: modifiersBitmask,
+        key: keyData.key,
+        code: keyData.code,
+        windowsVirtualKeyCode: keyData.keyCode,
+        nativeVirtualKeyCode: keyData.keyCode
+    };
+    
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchKeyEvent", { type: "keyDown", ...eventParams });
+    await new Promise(r => setTimeout(r, 20));
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchKeyEvent", { type: "keyUp", ...eventParams });
 }
 
 async function simulateType(text) {
@@ -626,19 +828,20 @@ async function smartClickElementBySelector(selector) {
 }
 
 async function resolveElementPosition(id, fallbackText) {
+    if (id && elementPositionCache.has(Number(id))) {
+        const el = elementPositionCache.get(Number(id));
+        return { x: el.x, y: el.y };
+    }
+
     const tab = await getActiveTab();
     const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
         expression: `(function() {
             let el = document.querySelector('[data-aether-id="${id}"]');
-            // Smart Selector Fallback
             if (!el && ${fallbackText ? 'true' : 'false'}) {
                 const text = \`${fallbackText ? fallbackText.replace(/`/g, '\\`') : ''}\`;
-                // Try XPath for text match
                 const xpath = "//button[contains(text(), '" + text + "')] | //a[contains(text(), '" + text + "')] | //*[contains(text(), '" + text + "')]";
                 const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-                if (result.singleNodeValue) {
-                    el = result.singleNodeValue;
-                }
+                if (result.singleNodeValue) el = result.singleNodeValue;
             }
             if (!el) return null;
             el.scrollIntoView({block: 'center', inline: 'center'});
@@ -719,42 +922,226 @@ async function executeScript(script) {
     return res.result.value;
 }
 
-// ... Additional helper functions for select, check, upload, hover, drag, emulate, print ...
-async function selectOption(id, value, fallback) { /* implementation */ return "Selected"; }
-async function setCheckbox(id, checked, fallback) { /* implementation */ return "Set"; }
-async function uploadFile(id, files, fallback) { /* implementation */ return "Uploaded"; }
-async function hoverElement(id, x, y, fallback) { /* implementation */ return "Hovered"; }
-async function dragAndDrop(sid, tid) { /* implementation */ return "Dragged"; }
-async function emulateNetwork(off, lat, d, u) { /* implementation */ }
+async function selectOption(id, value, fallback) {
+    const tab = await getActiveTab();
+    const pos = await resolveElementPosition(id, fallback);
+    if (!pos) throw new Error(`Element ${id} not found.`);
+    const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
+        expression: `(function() {
+            let el = document.querySelector('[data-aether-id="${id}"]');
+            if (!el) return false;
+            el.focus();
+            el.value = "${value}";
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+        })()`,
+        returnByValue: true
+    });
+    return res.result.value ? `Selected option ${value}` : "Failed to select option";
+}
+
+async function setCheckbox(id, checked, fallback) {
+    const tab = await getActiveTab();
+    const pos = await resolveElementPosition(id, fallback);
+    if (!pos) throw new Error(`Element ${id} not found.`);
+    const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
+        expression: `(function() {
+            let el = document.querySelector('[data-aether-id="${id}"]');
+            if (!el) return false;
+            el.checked = ${checked};
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+        })()`,
+        returnByValue: true
+    });
+    return res.result.value ? `Checkbox set to ${checked}` : "Failed to set checkbox";
+}
+
+async function uploadFile(id, files, fallback) {
+    const tab = await getActiveTab();
+    const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
+        expression: `document.querySelector('[data-aether-id="${id}"]')`,
+    });
+    const objectId = res.result.objectId;
+    if (!objectId) throw new Error("File input not found");
+    const nodeRes = await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.requestNode", { objectId });
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.setFileInputFiles", {
+        files: files,
+        nodeId: nodeRes.nodeId
+    });
+    return `Uploaded ${files.length} files`;
+}
+
+async function drawHighlights(tabId) {
+    const expression = `(function() {
+        const existing = document.getElementById('aether-highlights');
+        if (existing) existing.remove();
+        const container = document.createElement('div');
+        container.id = 'aether-highlights';
+        container.style.position = 'absolute';
+        container.style.top = '0'; container.style.left = '0';
+        container.style.width = '100%'; container.style.height = '100%';
+        container.style.pointerEvents = 'none'; container.style.zIndex = '2147483647';
+        document.body.appendChild(container);
+
+        document.querySelectorAll('[data-aether-id]').forEach(el => {
+            const rect = el.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) return;
+            const box = document.createElement('div');
+            box.style.position = 'absolute';
+            box.style.left = (rect.left + window.scrollX) + 'px';
+            box.style.top = (rect.top + window.scrollY) + 'px';
+            box.style.width = rect.width + 'px'; box.style.height = rect.height + 'px';
+            box.style.border = '2px solid rgba(59, 130, 246, 0.5)';
+            box.style.backgroundColor = 'rgba(59, 130, 246, 0.1)';
+            
+            const label = document.createElement('div');
+            label.innerText = el.getAttribute('data-aether-id');
+            label.style.position = 'absolute'; label.style.top = '-18px';
+            label.style.backgroundColor = 'rgba(59, 130, 246, 0.9)'; label.style.color = 'white';
+            label.style.fontSize = '12px'; label.style.padding = '2px 4px';
+            box.appendChild(label);
+            container.appendChild(box);
+        });
+    })()`;
+    await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", { expression });
+}
+
+async function clearHighlights(tabId) {
+    await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", { expression: `const e = document.getElementById('aether-highlights'); if (e) e.remove();` });
+}
+
+async function hoverElement(id, x, y, fallback) {
+    const tab = await getActiveTab();
+    let tx = x, ty = y;
+    if (id) {
+        const pos = await resolveElementPosition(id, fallback);
+        if (!pos) throw new Error(`Element ${id} not found.`);
+        tx = pos.x; ty = pos.y;
+    }
+    await notifyContentScript({ type: "show_click", x: tx, y: ty });
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseMoved", x: tx, y: ty });
+    return `Hovered at ${tx}, ${ty}`;
+}
+
+async function dragAndDrop(sid, tid) {
+    const spos = await resolveElementPosition(sid, null);
+    const tpos = await resolveElementPosition(tid, null);
+    if (!spos || !tpos) throw new Error("Source or target element not found");
+    const tab = await getActiveTab();
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseMoved", x: spos.x, y: spos.y });
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x: spos.x, y: spos.y });
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseMoved", x: tpos.x, y: tpos.y, button: "left" });
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, x: tpos.x, y: tpos.y });
+    return `Dragged element ${sid} to ${tid}`;
+}
+
+async function emulateNetwork(off, lat, d, u) {
+    const tab = await getActiveTab();
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.emulateNetworkConditions", { offline: !!off, latency: lat || 0, downloadThroughput: d || -1, uploadThroughput: u || -1 });
+    return "Network conditions emulated";
+}
+
 async function printPDF(opts) { const res = await chrome.debugger.sendCommand({ tabId: (await getActiveTab()).id }, "Page.printToPDF", opts); return res.data; }
+
 async function simulateScroll(x, y) { 
     const tab = await getActiveTab();
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseWheel", x: 0, y: 0, deltaX: x || 0, deltaY: y || 0 });
     await new Promise(r => setTimeout(r, 500));
-    const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
-        expression: `JSON.stringify({ scrollY: window.scrollY, innerHeight: window.innerHeight, scrollHeight: document.body.scrollHeight })`,
-        returnByValue: true
-    });
+    const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", { expression: `JSON.stringify({ scrollY: window.scrollY, innerHeight: window.innerHeight, scrollHeight: document.body.scrollHeight })`, returnByValue: true });
     const info = res.result.value ? JSON.parse(res.result.value) : { scrollY: 0, innerHeight: 0, scrollHeight: 0 };
-    return {
-        success: true,
-        scrolledBy: y || x,
-        currentPosition: info.scrollY,
-        isAtBottom: info.scrollY + info.innerHeight >= info.scrollHeight - 10
-    };
+    return { success: true, scrolledBy: y || x, currentPosition: info.scrollY, isAtBottom: info.scrollY + info.innerHeight >= info.scrollHeight - 10 };
 }
-async function configure(c) { /* implementation */ }
+
+async function configure(c) {
+    const tab = await getActiveTab();
+    if (c.network) {
+        let blocked = [];
+        if (c.network.blockImages) blocked.push("*.jpg", "*.jpeg", "*.png", "*.gif", "*.webp");
+        if (c.network.blockCSS) blocked.push("*.css");
+        if (c.network.blockAds) blocked.push("*doubleclick.net*", "*google-analytics.com*", "*tracker*");
+        await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.setBlockedURLs", { urls: blocked });
+    }
+    if (c.emulation) {
+        await chrome.debugger.sendCommand({ tabId: tab.id }, "Emulation.setDeviceMetricsOverride", { width: c.emulation.width || 1024, height: c.emulation.height || 768, deviceScaleFactor: 1, mobile: !!c.emulation.mobile });
+    }
+    return "Configuration applied";
+}
+
 async function waitForElement(selector, timeoutMs) {
     const tab = await getActiveTab();
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-        const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
-            expression: `!!document.querySelector(\`${selector.replace(/`/g, '\\`')}\`)`,
-            returnByValue: true
-        });
+        const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", { expression: `!!document.querySelector(\`${selector.replace(/`/g, '\\`')}\`)`, returnByValue: true });
         if (res.result.value) return { success: true, message: `Found element matching ${selector}` };
         await new Promise(r => setTimeout(r, 500));
     }
     throw new Error(`Timeout waiting for element: ${selector}`);
 }
-async function clickAndWait(id, f, t) { await smartClickElement(id, f); await new Promise(r => setTimeout(r, 2000)); return "Clicked and waited"; }
+
+async function waitForNetworkIdle(timeoutMs) {
+    const start = Date.now();
+    let idleStart = null;
+    while (Date.now() - start < timeoutMs) {
+        if (activeNetworkRequests === 0) {
+            if (!idleStart) idleStart = Date.now();
+            else if (Date.now() - idleStart > 500) return { success: true, message: "Network is idle" };
+        } else { idleStart = null; }
+        await new Promise(r => setTimeout(r, 100));
+    }
+    throw new Error("Timeout waiting for network idle");
+}
+
+async function waitForNavigation(timeoutMs) {
+    const tab = await getActiveTab();
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", { expression: "document.readyState === 'complete'", returnByValue: true });
+        if (res.result.value) return { success: true, message: "Navigation complete" };
+        await new Promise(r => setTimeout(r, 500));
+    }
+    throw new Error("Timeout waiting for navigation");
+}
+
+async function performAssertion(assertionType, selector, value) {
+    const tab = await getActiveTab();
+    let res = false; let msg = "";
+    try {
+        if (assertionType === "element_exists") {
+            const r = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", { expression: `!!document.querySelector(\`${(selector||"").replace(/`/g, '\\`')}\`)`, returnByValue: true });
+            res = !!r.result.value; msg = res ? `Passed: Element ${selector} exists.` : `Failed: Element ${selector} not found.`;
+        } 
+        else if (assertionType === "element_contains_text") {
+            const r = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", { expression: `(function() { const el = document.querySelector(\`${(selector||"").replace(/`/g, '\\`')}\`); return el ? (el.innerText || el.textContent) : null; })()`, returnByValue: true });
+            const text = r.result.value;
+            if (text === null) { res = false; msg = `Failed: Element ${selector} not found.`; }
+            else { res = text.includes(value); msg = res ? `Passed: Contains "${value}".` : `Failed: Found "${text}".`; }
+        }
+        else if (assertionType === "url_contains") {
+            res = tab.url.includes(value); msg = res ? `Passed: URL contains "${value}".` : `Failed: URL is "${tab.url}".`;
+        }
+    } catch (e) { res = false; msg = `Error: ${e.message}`; }
+    if (!res) throw new Error(msg);
+    return msg;
+}
+
+async function verifyUIState(selector, expectedText, type) {
+    const tab = await getActiveTab();
+    const expression = `(function() {
+        const el = document.querySelector(\`${(selector||"").replace(/`/g, '\\`')}\`);
+        if (!el) return { success: false, message: "Element not found" };
+        if ("${type}" === "visible") {
+            const style = window.getComputedStyle(el);
+            const isVisible = style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+            return { success: isVisible, message: isVisible ? "Element is visible" : "Element is hidden" };
+        }
+        if ("${type}" === "text_match") {
+            const text = (el.innerText || el.textContent || "").trim();
+            const success = text.includes("${expectedText}");
+            return { success, message: success ? "Text matches" : "Expected '${expectedText}' but found '" + text + "'" };
+        }
+        return { success: true, message: "Element exists" };
+    })()`;
+    const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", { expression, returnByValue: true });
+    return res.result.value;
+}

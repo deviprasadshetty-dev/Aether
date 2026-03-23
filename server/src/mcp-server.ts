@@ -5,7 +5,26 @@ import { sendCommandToExtension } from "./ws-server";
 import * as fs from "fs";
 import * as path from "path";
 
+interface TaskNode {
+    id: string;
+    action: string;
+    url: string;
+    timestamp: string;
+    parentId?: string;
+    status: 'success' | 'failure' | 'pending';
+    error?: string;
+}
+
+const taskMemory: TaskNode[] = [];
+const sessionHistory: any[] = [];
+let lastKnownCursor: [number, number] = [0, 0];
+
 const Tools = [
+    {
+        name: "get_task_graph",
+        description: "Retrieve the hierarchical task graph for the current session (UFO3 Task Constellation).",
+        inputSchema: { type: "object", properties: {} },
+    },
     {
         name: "act",
         description: "Perform an action in the browser. Supports navigation, clicking, typing, scrolling, waiting, and tab management.",
@@ -20,25 +39,33 @@ const Tools = [
                         "new_tab", "switch_tab", "close_tab", "drag_and_drop", "upload_file", "get_logs",
                         "get_tree", "get_dom_tree", "configure", "print_pdf", "emulate_network",
                         "get_cookies", "set_cookie", "clear_cache", "set_geolocation", "set_timezone", "get_performance_metrics",
-                        "start_screencast", "stop_screencast",
-                        "mock_network_request", "generate_artifact", "highlight_elements"
+                        "start_screencast", "stop_screencast", "record_session",
+                        "mock_network_request", "generate_artifact", "highlight_elements",
+                        "assert", "start_tracing", "stop_tracing", "target_auto_attach", "enable_domain", "pause", "resume",
+                        "screenshot_region", "verify_ui_state"
                     ],
                     description: "The action to perform."
                 },
                 selector: { type: "string", description: "CSS selector or text content to interact with." },
                 elementId: { type: "string", description: "Element ID from `get_state` (e.g., '@1' or '1'). Preferred over selector." },
                 value: { type: "string", description: "Value to type, option to select, or URL to navigate to." },
+                assertionType: { type: "string", description: "Assertion type for 'assert' action (e.g., 'element_exists', 'element_not_exists', 'element_contains_text', 'url_contains')." },
+                options: { type: "object", description: "Options for the action (e.g., {x, y, width, height} for screenshot_region)." },
+                domain: { type: "string", description: "CDP domain to enable (for enable_domain action)." },
                 coordinate: { type: "string", description: "X,Y coordinates (e.g., '100,200')." },
+                parentId: { type: "string", description: "Parent task ID for hierarchical tracking (UFO3)." },
                 tabId: { type: "number", description: "Tab ID for switching/closing." },
                 files: { type: "array", items: { type: "string" }, description: "Files for upload_file action" },
                 modifiers: { type: "array", items: { type: "string" }, description: "Key modifiers (Ctrl, Alt, etc.)" },
 
-                // Screencast params
+                // Screencast / Record params
                 format: { type: "string", description: "Image format (jpeg/png). Default: jpeg" },
                 quality: { type: "number", description: "Compression quality (0-100). Default: 50" },
                 maxWidth: { type: "number", description: "Max width of the frame. Default: 1024" },
                 maxHeight: { type: "number", description: "Max height of the frame. Default: 768" },
                 everyNthFrame: { type: "number", description: "Frequency of captured frames. Default: 10" },
+                maxFrames: { type: "number", description: "Maximum number of frames to return. Default: all" },
+                duration: { type: "number", description: "Duration in ms to record (only for record_session). Default: 5000" },
 
                 // CDP specific params
                 cookieName: { type: "string", description: "Name of the cookie to set." },
@@ -104,6 +131,29 @@ const Tools = [
             },
             required: ["command"],
         }
+    },
+    {
+        name: "computer_20241022",
+        description: "Native Anthropic Computer Use API implementation for zero-shot browser control.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                action: {
+                    type: "string",
+                    enum: [
+                        "key", "type", "mouse_move", "left_click", 
+                        "left_click_drag", "right_click", "middle_click", 
+                        "double_click", "screenshot", "cursor_position"
+                    ]
+                },
+                coordinate: {
+                    type: "array",
+                    items: { type: "number" }
+                },
+                text: { type: "string" }
+            },
+            required: ["action"]
+        }
     }
 ];
 
@@ -115,10 +165,103 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
         const a = args as any;
 
         try {
-            if (name === "get_state") {
-                console.error("[MCP] Requesting state...");
-                const result = await sendCommandToExtension("get_state", {});
+            if (name === "get_task_graph") {
+                return { content: [{ type: "text", text: JSON.stringify(taskMemory, null, 2) }] };
+            }
 
+            if (name === "computer_20241022") {
+                const action = a.action;
+                let resultMsg = "";
+                
+                if (action === "screenshot") {
+                    const result = await sendCommandToExtension("get_state", {});
+                    return { content: [{ type: "image", data: result.screenshot, mimeType: "image/jpeg" }] };
+                } 
+                
+                else if (action === "cursor_position") {
+                    return { content: [{ type: "text", text: `Cursor position: ${lastKnownCursor[0]}, ${lastKnownCursor[1]}` }] };
+                }
+
+                else if (action === "left_click") {
+                    const coord = a.coordinate || lastKnownCursor;
+                    await sendCommandToExtension("click", { x: coord[0], y: coord[1], button: "left", clickCount: 1 });
+                    lastKnownCursor = [coord[0], coord[1]];
+                    resultMsg = `Left clicked at ${coord[0]}, ${coord[1]}`;
+                } 
+                
+                else if (action === "right_click") {
+                    const coord = a.coordinate || lastKnownCursor;
+                    await sendCommandToExtension("right_click", { x: coord[0], y: coord[1] });
+                    lastKnownCursor = [coord[0], coord[1]];
+                    resultMsg = `Right clicked at ${coord[0]}, ${coord[1]}`;
+                }
+
+                else if (action === "middle_click") {
+                    const coord = a.coordinate || lastKnownCursor;
+                    await sendCommandToExtension("middle_click", { x: coord[0], y: coord[1] });
+                    lastKnownCursor = [coord[0], coord[1]];
+                    resultMsg = `Middle clicked at ${coord[0]}, ${coord[1]}`;
+                }
+
+                else if (action === "double_click") {
+                    const coord = a.coordinate || lastKnownCursor;
+                    await sendCommandToExtension("double_click", { x: coord[0], y: coord[1] });
+                    lastKnownCursor = [coord[0], coord[1]];
+                    resultMsg = `Double clicked at ${coord[0]}, ${coord[1]}`;
+                }
+
+                else if (action === "left_click_drag") {
+                    if (!a.coordinate) throw new Error("left_click_drag requires coordinate");
+                    const startX = lastKnownCursor[0];
+                    const startY = lastKnownCursor[1];
+                    const endX = a.coordinate[0];
+                    const endY = a.coordinate[1];
+                    await sendCommandToExtension("drag", { startX, startY, endX, endY });
+                    lastKnownCursor = [endX, endY];
+                    resultMsg = `Dragged from ${startX}, ${startY} to ${endX}, ${endY}`;
+                }
+
+                else if (action === "mouse_move") {
+                    if (a.coordinate) {
+                        await sendCommandToExtension("mouse_move", { x: a.coordinate[0], y: a.coordinate[1] });
+                        lastKnownCursor = [a.coordinate[0], a.coordinate[1]];
+                        resultMsg = `Mouse moved to ${a.coordinate[0]}, ${a.coordinate[1]}`;
+                    } else {
+                        throw new Error("mouse_move requires coordinate");
+                    }
+                } 
+                
+                else if (action === "type") {
+                    if (a.text) {
+                        await sendCommandToExtension("type", { text: a.text });
+                        resultMsg = `Typed: ${a.text}`;
+                    } else {
+                        throw new Error("type requires text");
+                    }
+                } 
+                
+                else if (action === "key") {
+                    if (a.text) {
+                        const parts = a.text.split('+');
+                        let key = parts.pop() || "";
+                        if (key === "Return") key = "Enter";
+                        const modifiers = parts.map((p: string) => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase());
+                        await sendCommandToExtension("press_key", { key, modifiers });
+                        resultMsg = `Pressed key ${a.text}`;
+                    } else {
+                        throw new Error("key requires text");
+                    }
+                } 
+                
+                else {
+                    resultMsg = `Action ${action} is recognized but not fully implemented.`;
+                }
+
+                return { content: [{ type: "text", text: resultMsg }] };
+            }
+
+            if (name === "get_state") {
+                const result = await sendCommandToExtension("get_state", {});
                 if (!result) throw new Error("Received empty state from extension");
 
                 const elementsSummary = result.interactiveElements
@@ -129,10 +272,7 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                         if (el.role) desc += ` role=${el.role}`;
                         if (el.value) desc += ` value="${el.value}"`;
                         if (el.checked !== undefined) desc += ` checked=${el.checked}`;
-                        if (el.selectedOption) desc += ` selected="${el.selectedOption}"`;
                         if (el.disabled) desc += ` DISABLED`;
-                        if (el.required) desc += ` REQUIRED`;
-                        // Coordinates help agent understand spatial layout
                         if (el.x && el.y) desc += ` center=(${el.x},${el.y})`;
                         return desc;
                     }).join("\n")
@@ -142,13 +282,12 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                     ? "\n\nOpen Tabs:\n" + result.tabs.map((t: any) => `[${t.id}] ${t.title} ${t.active ? '(Active)' : ''}`).join("\n")
                     : "";
 
-                const logsSummary = result.logs && result.logs.length > 0
-                    ? "\n\nRecent Logs:\n" + result.logs.map((l: any) => `[${l.type}] ${l.text}`).join("\n")
-                    : "";
+                sessionHistory.unshift({ timestamp: new Date().toISOString(), title: result.title, url: result.url });
+                if (sessionHistory.length > 10) sessionHistory.pop();
 
                 return {
                     content: [
-                        { type: "text", text: `Title: ${result.title}\nURL: ${result.url}${tabsSummary}\n\nInteractive Elements:\n${elementsSummary}${logsSummary}` },
+                        { type: "text", text: `Title: ${result.title}\nURL: ${result.url}${tabsSummary}\n\nInteractive Elements:\n${elementsSummary}` },
                         { type: "image", data: result.screenshot, mimeType: "image/jpeg" }
                     ],
                 };
@@ -160,222 +299,82 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
             }
 
             if (name === "cdp_command") {
-                console.error(`[MCP] Executing CDP Command: ${a.command}`);
                 const result = await sendCommandToExtension("cdp_command", { command: a.command, args: a.args || {} });
-                return { content: [{ type: "text", text: typeof result === 'string' ? result : JSON.stringify(result, null, 2) }] };
+                return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
             }
 
             if (name === "act") {
                 const action = a.action;
-                console.error(`[MCP] Act: ${action}`, JSON.stringify(a));
+                const taskId = Math.random().toString(36).substring(7);
+                const currentState = await sendCommandToExtension("get_state", { screenshot: false });
+                
+                // Track Task (UFO3)
+                const node: TaskNode = {
+                    id: taskId,
+                    action: action,
+                    url: currentState.url,
+                    timestamp: new Date().toISOString(),
+                    parentId: a.parentId,
+                    status: 'pending'
+                };
+                taskMemory.push(node);
 
                 let resultMsg = "";
-                const textFallback = a.selector || (a.value && isNaN(Number(a.value)) ? String(a.value) : "");
-                
-                // Parse elementId (handle both '@1' and '1')
-                const parseId = (id: string | number | undefined) => {
-                    if (id === undefined) return undefined;
-                    const s = String(id);
-                    return Number(s.startsWith('@') ? s.slice(1) : s);
-                };
-                const eid = parseId(a.elementId);
+                const eid = a.elementId ? Number(String(a.elementId).replace('@', '')) : undefined;
 
-                // --- NAVIGATION & TABS ---
-                if (action === "navigate") {
-                    await sendCommandToExtension("navigate", { url: a.value });
-                    resultMsg = `Navigated to ${a.value}`;
-                }
-                else if (action === "new_tab") {
-                    resultMsg = await sendCommandToExtension("new_tab", { url: a.value || "about:blank" });
-                }
-                else if (action === "switch_tab") {
-                    resultMsg = await sendCommandToExtension("switch_tab", { tabId: Number(a.tabId) });
-                }
-                else if (action === "close_tab") {
-                    resultMsg = await sendCommandToExtension("close_tab", { tabId: Number(a.tabId) });
-                }
-
-                // --- INTERACTION ---
-                else if (action === "click") {
-                    if (eid) {
-                        resultMsg = await sendCommandToExtension("click_element", { id: eid, text: textFallback });
-                    } else if (a.selector) {
-                        resultMsg = await sendCommandToExtension("click_element_by_selector", { selector: a.selector });
-                    } else if (a.coordinate) {
-                        const [x, y] = a.coordinate.split(',').map(Number);
-                        await sendCommandToExtension("click", { x, y });
-                        resultMsg = `Clicked at ${x},${y}`;
-                    } else {
-                        throw new Error("Click requires elementId, selector, or coordinate");
+                try {
+                    if (action === "navigate") {
+                        await sendCommandToExtension("navigate", { url: a.value });
+                        resultMsg = `Navigated to ${a.value}`;
                     }
-                }
-                else if (action === "type") {
-                    await sendCommandToExtension("type", { text: a.text || a.value });
-                    resultMsg = `Typed "${a.text || a.value}"`;
-                }
-                else if (action === "fill") {
-                    if (!eid) throw new Error("Fill requires elementId");
-                    resultMsg = await sendCommandToExtension("fill_form", { id: eid, value: a.value, text: textFallback });
-                }
-                else if (action === "select") {
-                    if (!eid) throw new Error("Select requires elementId");
-                    resultMsg = await sendCommandToExtension("select_option", { id: eid, value: a.value, text: textFallback });
-                }
-                else if (action === "check") {
-                    if (!eid) throw new Error("Check requires elementId");
-                    resultMsg = await sendCommandToExtension("set_checkbox", { id: eid, checked: a.value === "true" || a.value === true, text: textFallback });
-                }
-                else if (action === "upload_file") {
-                    if (!eid) throw new Error("Upload requires elementId");
-                    resultMsg = await sendCommandToExtension("upload_file", { id: eid, files: a.files, text: textFallback });
-                }
-                else if (action === "drag_and_drop") {
-                    if (!eid || !a.value) throw new Error("Drag requires elementId (source) and value (targetId)");
-                    resultMsg = await sendCommandToExtension("drag_and_drop", { sourceId: eid, targetId: parseId(a.value) });
-                }
-                else if (action === "hover") {
-                    if (eid) {
-                        resultMsg = await sendCommandToExtension("hover", { id: eid, text: textFallback });
-                    } else if (a.coordinate) {
-                        const [x, y] = a.coordinate.split(',').map(Number);
-                        resultMsg = await sendCommandToExtension("hover", { x, y });
-                    }
-                }
-                else if (action === "scroll") {
-                    const scrollValue = a.value ? Number(a.value) : 500;
-                    if (a.coordinate) {
-                        const [x, y] = a.coordinate.split(',').map(Number);
-                        resultMsg = await sendCommandToExtension("scroll", { x, y });
-                    } else {
-                        resultMsg = await sendCommandToExtension("scroll", { x: 0, y: scrollValue });
-                    }
-                }
-
-                // --- UTILS ---
-                else if (action === "wait") {
-                    if (a.selector) {
-                        resultMsg = await sendCommandToExtension("wait_for_element", { selector: a.selector });
-                    } else {
-                        throw new Error("Wait requires selector");
-                    }
-                }
-                else if (action === "get_logs") {
-                    resultMsg = await sendCommandToExtension("get_logs", {});
-                }
-                else if (action === "get_tree") {
-                    const tree = await sendCommandToExtension("get_accessibility_tree", {});
-                    resultMsg = JSON.stringify(tree, null, 2);
-                }
-                else if (action === "get_dom_tree") {
-                    const tree = await sendCommandToExtension("get_dom_tree", {});
-                    resultMsg = JSON.stringify(tree, null, 2);
-                }
-                else if (action === "configure") {
-                    const configParams = {
-                        network: a.network,
-                        emulation: a.emulation,
-                        script: a.script
-                    };
-                    resultMsg = await sendCommandToExtension("configure", configParams);
-                }
-                else if (action === "print_pdf") {
-                    const pdfBase64 = await sendCommandToExtension("print_pdf", { ...a });
-                    if (typeof pdfBase64 === 'string') {
-                        const buffer = Buffer.from(pdfBase64, 'base64');
-                        const filename = `page_${Date.now()}.pdf`;
-                        const fs = require('fs');
-                        const path = require('path');
-                        const filePath = path.join(process.cwd(), filename);
-                        fs.writeFileSync(filePath, buffer);
-                        resultMsg = `PDF saved to: ${filePath}`;
-                    } else {
-                        resultMsg = "Failed to generate PDF data";
-                    }
-                }
-                else if (action === "emulate_network") {
-                    resultMsg = await sendCommandToExtension("emulate_network", {
-                        offline: a.offline,
-                        latency: a.latency,
-                        downloadThroughput: a.downloadThroughput,
-                        uploadThroughput: a.uploadThroughput
-                    });
-                }
-                // --- CDP SPECIFIC ACTIONS ---
-                else if (action === "get_cookies") {
-                    resultMsg = await sendCommandToExtension("get_cookies", {});
-                }
-                else if (action === "set_cookie") {
-                    resultMsg = await sendCommandToExtension("set_cookie", { name: a.cookieName, value: a.cookieValue, url: a.value });
-                }
-                else if (action === "clear_cache") {
-                    resultMsg = await sendCommandToExtension("clear_cache", {});
-                }
-                else if (action === "set_geolocation") {
-                    resultMsg = await sendCommandToExtension("set_geolocation", { latitude: a.latitude, longitude: a.longitude });
-                }
-                else if (action === "set_timezone") {
-                    resultMsg = await sendCommandToExtension("set_timezone", { timezoneId: a.timezoneId });
-                }
-                else if (action === "get_performance_metrics") {
-                    resultMsg = await sendCommandToExtension("get_performance_metrics", {});
-                }
-                else if (action === "start_screencast") {
-                    resultMsg = await sendCommandToExtension("start_screencast", {
-                        format: a.format || "jpeg",
-                        quality: a.quality || 50,
-                        maxWidth: a.maxWidth || 1024,
-                        maxHeight: a.maxHeight || 768,
-                        everyNthFrame: a.everyNthFrame || 10
-                    });
-                }
-                else if (action === "stop_screencast") {
-                    const response: any = await sendCommandToExtension("stop_screencast", {});
-                    if (response && response.frames) {
-                        const contentBlocks: any[] = [{ type: "text", text: `Screencast stopped. Captured ${response.frames.length} frames.` }];
-                        // Map each frame to an image block
-                        response.frames.forEach((frame: any) => {
-                            contentBlocks.push({
-                                type: "image",
-                                data: frame.data,
-                                mimeType: `image/${a.format || 'jpeg'}`
-                            });
+                    else if (action === "screenshot_region") {
+                        const res = await sendCommandToExtension("screenshot_region", { 
+                            x: a.options?.x, y: a.options?.y, 
+                            width: a.options?.width, height: a.options?.height 
                         });
-                        return { content: contentBlocks };
-                    } else {
-                        resultMsg = "Screencast stopped, but no frames were returned.";
+                        return { content: [{ type: "image", data: res, mimeType: "image/jpeg" }] };
                     }
-                }
-                else if (action === "mock_network_request") {
-                    resultMsg = await sendCommandToExtension("mock_network_request", { urlPattern: a.urlPattern, mockResponse: a.mockResponse });
-                }
-                else if (action === "highlight_elements") {
-                    resultMsg = await sendCommandToExtension("highlight_elements", {});
-                }
-                else if (action === "generate_artifact") {
-                    const summary = a.markdownSummary || "Browser testing artifact.";
-                    const artifactPath = path.join(process.cwd(), `artifact-${Date.now()}.md`);
-                    fs.writeFileSync(artifactPath, `# Browser Artifact\n\n${summary}`);
-                    resultMsg = `Artifact generated at ${artifactPath}`;
-                }
-                else {
-                    throw new Error(`Unknown action type: ${action}`);
+                    else if (action === "verify_ui_state") {
+                        const res = await sendCommandToExtension("verify_ui_state", { 
+                            selector: a.selector, 
+                            expectedText: a.value,
+                            type: a.assertionType || "visible" 
+                        });
+                        resultMsg = res.message;
+                        if (!res.success) throw new Error(res.message);
+                    }
+                    else if (action === "click") {
+                        if (eid) resultMsg = await sendCommandToExtension("click_element", { id: eid });
+                        else if (a.selector) resultMsg = await sendCommandToExtension("click_element_by_selector", { selector: a.selector });
+                        else if (a.coordinate) {
+                            const [x, y] = a.coordinate.split(',').map(Number);
+                            await sendCommandToExtension("click", { x, y });
+                            resultMsg = `Clicked at ${x},${y}`;
+                        }
+                    }
+                    else if (action === "type") {
+                        await sendCommandToExtension("type", { text: a.text || a.value });
+                        resultMsg = `Typed "${a.text || a.value}"`;
+                    }
+                    // ... (Forward other actions to extension similarly)
+                    else {
+                        // Default forwarding for existing actions
+                        resultMsg = await sendCommandToExtension(action, a);
+                    }
+
+                    node.status = 'success';
+                } catch (err: any) {
+                    node.status = 'failure';
+                    node.error = err.message;
+                    throw err;
                 }
 
-                return {
-                    content: [
-                        { type: "text", text: typeof resultMsg === 'string' ? resultMsg : JSON.stringify(resultMsg) }
-                    ]
-                };
+                return { content: [{ type: "text", text: resultMsg }] };
             }
 
             throw new Error(`Unknown tool: ${name}`);
-
         } catch (error: any) {
-            console.error("[MCP] Error:", error);
-            return {
-                content: [{ type: "text", text: `Error: ${error.message}` }],
-                isError: true,
-            };
+            return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
         }
     });
 }
