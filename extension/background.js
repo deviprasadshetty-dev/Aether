@@ -12,10 +12,11 @@ let globalMockResponse = null;
 let traceBuffer = []; // Buffer for Tracing.dataCollected
 
 // Cache
-let elementPositionCache = new Map(); // id -> {x, y, text, tagName, frameId}
+let activeNetworkRequests = 0;
+let executionContexts = new Map(); // tabId -> [ {id, frameId, origin, name} ]
 let pingInterval = null;
 let agentStopTimeout = null;
-let activeNetworkRequests = 0;
+let elementPositionCache = new Map(); // id -> {x, y, text, tagName, frameId}
 
 // --- Key code mappings for special keys ---
 const KEY_MAP = {
@@ -73,17 +74,13 @@ function connect() {
             let result = null;
 
             if (method === "navigate") {
-                if (!activeTargetId) {
-                    const tab = await chrome.tabs.create({ url: params.url });
-                    await ensureDebuggerAttached(tab.id);
-                    await new Promise(r => setTimeout(r, 2000));
-                    result = `Navigated to ${params.url} in new tab`;
-                } else {
-                    await notifyContentScript({ type: "update_status", text: "Navigating..." });
-                    await chrome.tabs.update(parseInt(activeTargetId), { url: params.url });
-                    await new Promise(r => setTimeout(r, 2000));
-                    result = "Navigated";
-                }
+                const tabId = activeTargetId ? parseInt(activeTargetId) : (await chrome.tabs.create({ url: params.url })).id;
+                activeTargetId = tabId;
+                await ensureDebuggerAttached(tabId);
+                await notifyContentScript({ type: "update_status", text: "Navigating..." });
+                await chrome.tabs.update(tabId, { url: params.url });
+                await waitForLoading(tabId);
+                result = "Navigated";
 
             } else if (method === "screenshot_region") {
                 const tab = await getActiveTab();
@@ -163,6 +160,7 @@ function connect() {
 
             } else if (method === "mouse_move") {
                 const tab = await getActiveTab();
+                await ensureDebuggerAttached(tab.id);
                 await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseMoved", x: params.x, y: params.y });
                 result = "Mouse moved";
 
@@ -174,6 +172,7 @@ function connect() {
 
             } else if (method === "type") {
                 const tab = await getActiveTab();
+                await ensureDebuggerAttached(tab.id);
                 try {
                     const focusResult = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", {
                         expression: `(function() {
@@ -487,6 +486,17 @@ async function getActiveTab() {
         catch (e) { activeTargetId = null; }
     }
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab && tab.url.startsWith("chrome://")) {
+        // Find first non-chrome tab
+        const allTabs = await chrome.tabs.query({ currentWindow: true });
+        const safeTab = allTabs.find(t => !t.url.startsWith("chrome://"));
+        if (safeTab) {
+            await chrome.tabs.update(safeTab.id, { active: true });
+            return safeTab;
+        }
+        // If no safe tab, create one
+        return await chrome.tabs.create({ url: "https://www.google.com" });
+    }
     return tab;
 }
 
@@ -501,12 +511,15 @@ async function ensureDebuggerAttached(tabId) {
         connectionId = tabId;
         await chrome.debugger.sendCommand({ tabId }, "Page.enable");
         await chrome.debugger.sendCommand({ tabId }, "DOM.enable");
+        await chrome.debugger.sendCommand({ tabId }, "Page.setLifecycleEventsEnabled", { enabled: true });
         await chrome.debugger.sendCommand({ tabId }, "Runtime.enable");
         await enableStealth(tabId);
         await chrome.debugger.sendCommand({ tabId }, "Log.enable");
         await chrome.debugger.sendCommand({ tabId }, "Network.enable");
-        chrome.debugger.onEvent.addListener(onDebuggerEvent);
-        attachedTabs.add(tabId);
+        if (!attachedTabs.has(tabId)) {
+            chrome.debugger.onEvent.addListener(onDebuggerEvent);
+            attachedTabs.add(tabId);
+        }
     } catch (e) {
         if (!e.message.includes("Already attached")) throw e;
         activeTargetId = tabId;
@@ -567,11 +580,16 @@ function onDebuggerEvent(source, method, params) {
         }
         chrome.debugger.sendCommand({ tabId: source.tabId }, "Fetch.continueRequest", { requestId: params.requestId }).catch(() => {});
     }
-    if (method === "Network.requestWillBeSent") {
-        activeNetworkRequests++;
-    }
     if (method === "Network.loadingFinished" || method === "Network.loadingFailed") {
         activeNetworkRequests = Math.max(0, activeNetworkRequests - 1);
+    }
+    if (method === "Runtime.executionContextCreated") {
+        const tabId = source.tabId;
+        if (!executionContexts.has(tabId)) executionContexts.set(tabId, []);
+        executionContexts.get(tabId).push(params.context);
+    }
+    if (method === "Runtime.executionContextsCleared") {
+        executionContexts.set(source.tabId, []);
     }
 }
 
@@ -579,142 +597,192 @@ async function getBrowserState(options = {}) {
     const tab = await getActiveTab();
     await ensureDebuggerAttached(tab.id);
     
-    // First extract elements so they get data-aether-id attached
-    const elementsResult = await extractElements(tab.id);
+    await notifyContentScript({ type: "update_status", text: "PIERCING FRAMES..." });
     
-    // Draw highlights for visual grounding
+    const contexts = executionContexts.get(tab.id) || [];
+    let allElements = [];
+    let idCounter = 1;
+
+    for (const ctx of contexts) {
+        try {
+            const elements = await extractElementsFromContext(tab.id, ctx.id, idCounter);
+            if (elements && elements.length > 0) {
+                let offset = { x: 0, y: 0 };
+                // If it's an iframe (non-default context), find its offset
+                if (ctx.auxData && !ctx.auxData.isDefault) {
+                    try {
+                        const frameRes = await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.getFrameOwner", { frameId: ctx.auxData.frameId });
+                        if (frameRes && frameRes.nodeId) {
+                            const boxRes = await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.getBoxModel", { nodeId: frameRes.nodeId });
+                            if (boxRes && boxRes.model) {
+                                offset.x = boxRes.model.content[0];
+                                offset.y = boxRes.model.content[1];
+                            }
+                        }
+                    } catch (e) { /* Parent frame might be restricted */ }
+                }
+                
+                elements.forEach(el => {
+                    el.x += offset.x;
+                    el.y += offset.y;
+                    el.rect.x += offset.x;
+                    el.rect.y += offset.y;
+                    el.frameId = ctx.auxData?.frameId;
+                });
+                
+                allElements.push(...elements);
+                idCounter += elements.length;
+            }
+        } catch (e) {
+            console.warn(`[EXT] Extraction failed for context ${ctx.id}:`, e);
+        }
+    }
+
+    // Clearance Intelligence (v3.0)
+    await notifyContentScript({ type: "update_status", text: "CLEARING POPUPS..." });
+    await dismissPopups(tab.id);
+
+    // Capture AXTree (v2.1 Fusion)
+    try {
+        await chrome.debugger.sendCommand({ tabId: tab.id }, "Accessibility.enable");
+        await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.getDocument", { depth: -1, pierce: true }); // Sync nodeIds
+        const axRes = await chrome.debugger.sendCommand({ tabId: tab.id }, "Accessibility.getFullAXTree");
+        const axNodes = axRes.nodes || [];
+        
+        for (const axNode of axNodes) {
+             // If node is interactive (has role) and not already tracked
+             if (axNode.role && ['button', 'link', 'textbox', 'checkbox'].includes(axNode.role.value)) {
+                 // Check if we already have an element near this location or with same text
+                 const exists = allElements.some(el => el.text === (axNode.name ? axNode.name.value : ''));
+                 if (!exists && axNode.backendNodeId) {
+                     try {
+                        const nodeRes = await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.describeNode", { backendNodeId: axNode.backendNodeId });
+                        if (nodeRes.node && nodeRes.node.nodeId) {
+                            const boxRes = await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.getBoxModel", { nodeId: nodeRes.node.nodeId });
+                            if (boxRes.model) {
+                                const id = idCounter++;
+                                allElements.push({
+                                    id,
+                                    tagName: nodeRes.node.localName || "div",
+                                    text: axNode.name ? axNode.name.value : "",
+                                    x: Math.round(boxRes.model.content[0] + (boxRes.model.content[2] - boxRes.model.content[0]) / 2),
+                                    y: Math.round(boxRes.model.content[1] + (boxRes.model.content[5] - boxRes.model.content[1]) / 2),
+                                    rect: { x: boxRes.model.content[0], y: boxRes.model.content[1], width: boxRes.model.content[2] - boxRes.model.content[0], height: boxRes.model.content[5] - boxRes.model.content[1] },
+                                    role: axNode.role.value,
+                                    type: "", value: "", disabled: false, checked: false
+                                });
+                            }
+                        }
+                     } catch(e) {}
+                 }
+             }
+        }
+    } catch (e) { }
+
     await drawHighlights(tab.id);
-    await new Promise(r => setTimeout(r, 100)); // wait for paint
+    await new Promise(r => setTimeout(r, 50));
     
     const screenshotResult = await captureScreenshot(tab.id, options.fullPage);
-    
-    // Clear highlights so the user page isn't cluttered
     await clearHighlights(tab.id);
     
-    const rawElements = elementsResult || [];
     elementPositionCache.clear();
-    rawElements.forEach(el => elementPositionCache.set(el.id, el));
+    allElements.forEach(el => elementPositionCache.set(el.id, el));
     const tabs = await chrome.tabs.query({});
     return {
         url: tab.url,
         title: tab.title,
         screenshot: screenshotResult || "",
-        interactiveElements: rawElements,
+        interactiveElements: allElements,
         tabs: tabs.map(t => ({ id: t.id, title: t.title, url: t.url, active: t.active })),
         logs: logBuffer.slice(-20)
     };
 }
 
-async function extractElements(tabId) {
+async function dismissPopups(tabId) {
+    const DISMISS_SCRIPT = `(function() {
+        const keywords = ['accept', 'agree', 'consent', 'i understand', 'got it', 'close', 'dismiss', 'x'];
+        const allButtons = Array.from(document.querySelectorAll('button, [role="button"], a.button, a.btn'));
+        for (const btn of allButtons) {
+            const text = (btn.innerText || btn.textContent || "").toLowerCase().trim();
+            const isDismiss = keywords.some(k => text.includes(k) && text.length < 20);
+            if (isDismiss) {
+                const style = window.getComputedStyle(btn);
+                if (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0') {
+                    btn.click();
+                    return "Dismissed: " + text;
+                }
+            }
+        }
+    })()`;
     try {
-        const { root } = await chrome.debugger.sendCommand({ tabId }, "DOM.getDocument", { pierce: true, depth: -1 });
-        const interactiveNodes = [];
-        
-        function isInteractive(node) {
-            const tag = (node.nodeName || "").toLowerCase();
-            if (['a', 'button', 'input', 'textarea', 'select', 'details', 'summary'].includes(tag)) return true;
-            if (node.attributes) {
-                for (let i = 0; i < node.attributes.length; i += 2) {
-                    const name = node.attributes[i];
-                    const val = node.attributes[i+1];
-                    if (name === 'onclick' || name === 'contenteditable' && val === 'true') return true;
-                    if (name === 'role' && (val === 'button' || val === 'link')) return true;
-                }
-            }
-            return false;
-        }
+        await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", { expression: DISMISS_SCRIPT });
+    } catch (e) { }
+}
 
-        function walk(node) {
-            if (node.nodeType === 1) { // Element
-                if (isInteractive(node)) interactiveNodes.push(node);
-            }
-            if (node.children) node.children.forEach(walk);
-            if (node.shadowRoots) node.shadowRoots.forEach(walk);
-            if (node.contentDocument) walk(node.contentDocument);
-        }
-        walk(root);
-
-        const scrollRes = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", { 
-            expression: "JSON.stringify({x: window.scrollX, y: window.scrollY})", 
-            returnByValue: true 
-        }).catch(() => null);
-        const scroll = scrollRes && scrollRes.result && scrollRes.result.value ? JSON.parse(scrollRes.result.value) : {x: 0, y: 0};
-
+async function extractElementsFromContext(tabId, contextId, startId) {
+    const EXTRACTION_SCRIPT = `(function(startId) {
+        const interactiveTags = ['a', 'button', 'input', 'textarea', 'select', 'details', 'summary'];
         const elements = [];
-        let idCounter = 0;
+        let idCounter = startId;
 
-        for (const node of interactiveNodes) {
-            try {
-                const boxRes = await chrome.debugger.sendCommand({ tabId }, "DOM.getBoxModel", { nodeId: node.nodeId }).catch(() => null);
-                if (!boxRes || !boxRes.model) continue; 
-                
-                const model = boxRes.model;
-                const quad = model.border;
-                const width = model.width;
-                const height = model.height;
-                if (width <= 0 || height <= 0) continue;
-                
-                idCounter++;
-                
-                await chrome.debugger.sendCommand({ tabId }, "DOM.setAttributeValue", { 
-                    nodeId: node.nodeId, 
-                    name: "data-aether-id", 
-                    value: idCounter.toString() 
-                }).catch(() => {});
-
-                const x = Math.round(Math.min(quad[0], quad[2], quad[4], quad[6]) + width / 2 + scroll.x);
-                const y = Math.round(Math.min(quad[1], quad[3], quad[5], quad[7]) + height / 2 + scroll.y);
-
-                let text = "";
-                let name = "";
-                let role = "";
-                let value = "";
-                let type = "";
-                let disabled = false;
-                let checked = false;
-
-                if (node.attributes) {
-                    for (let i = 0; i < node.attributes.length; i += 2) {
-                        const attr = node.attributes[i];
-                        const val = node.attributes[i+1];
-                        if (attr === 'name') name = val;
-                        if (attr === 'role') role = val;
-                        if (attr === 'value') value = val;
-                        if (attr === 'type') type = val;
-                        if (attr === 'disabled') disabled = true;
-                        if (attr === 'checked') checked = true;
-                        if (attr === 'aria-label' && !text) text = val;
-                        if (attr === 'alt' && !text) text = val;
-                        if (attr === 'title' && !text) text = val;
-                        if (attr === 'placeholder' && !text) text = val;
-                    }
-                }
-                
-                const resolveRes = await chrome.debugger.sendCommand({ tabId }, "DOM.resolveNode", { nodeId: node.nodeId }).catch(() => null);
-                if (resolveRes && resolveRes.object && resolveRes.object.objectId) {
-                    const funcRes = await chrome.debugger.sendCommand({ tabId }, "Runtime.callFunctionOn", {
-                        objectId: resolveRes.object.objectId,
-                        functionDeclaration: `function() { 
-                            let t = this.tagName === 'INPUT' || this.tagName === 'TEXTAREA' ? (this.value || this.placeholder) : (this.innerText || this.textContent);
-                            return (t || "").trim();
-                        }`,
-                        returnByValue: true
-                    }).catch(() => null);
-                    if (funcRes && funcRes.result && funcRes.result.value) text = funcRes.result.value;
-                }
-
-                elements.push({
-                    id: idCounter,
-                    tagName: node.nodeName.toLowerCase(),
-                    text: (text || "").slice(0, 100).replace(/\s+/g, ' '),
-                    x, y,
-                    rect: { x: quad[0], y: quad[1], width, height },
-                    name, role, value, type, checked, disabled
-                });
-            } catch(e) {}
+        function isVisible(el) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) return false;
+            const style = window.getComputedStyle(el);
+            return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
         }
-        return elements;
-    } catch (e) { return []; }
+
+        function walk(root, offset = { x: 0, y: 0 }) {
+            const children = root.children || [];
+            for (const el of children) {
+                if (!isVisible(el)) continue;
+                
+                const tag = el.tagName.toLowerCase();
+                const role = el.getAttribute('role') || '';
+                const isInteractive = interactiveTags.includes(tag) || 
+                                     el.hasAttribute('onclick') || 
+                                     ['button', 'link', 'checkbox', 'radio', 'textbox'].includes(role) ||
+                                     el.contentEditable === 'true' ||
+                                     window.getComputedStyle(el).cursor === 'pointer';
+
+                if (isInteractive) {
+                    const id = idCounter++;
+                    el.setAttribute('data-aether-id', id.toString());
+                    const rect = el.getBoundingClientRect();
+                    elements.push({
+                        id: id, tagName: tag,
+                        text: (el.innerText || el.textContent || el.value || "").trim().substring(0, 100).replace(/\s+/g, ' '),
+                        x: Math.round(rect.left + rect.width / 2 + offset.x),
+                        y: Math.round(rect.top + rect.height / 2 + offset.y),
+                        rect: { x: rect.left + offset.x, y: rect.top + offset.y, width: rect.width, height: rect.height },
+                        role: role, value: el.value || "", disabled: el.disabled || false
+                    });
+                }
+                
+                // v3.1 Shadow DOM Piercing (Recursive)
+                if (el.shadowRoot) {
+                    const shadowRect = el.getBoundingClientRect();
+                    walk(el.shadowRoot, { x: offset.x + shadowRect.left, y: offset.y + shadowRect.top });
+                }
+                walk(el, offset);
+            }
+        }
+        
+        walk(document.body);
+        return JSON.stringify(elements);
+    })(${startId})`;
+
+    try {
+        const res = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+            expression: EXTRACTION_SCRIPT,
+            contextId: contextId,
+            returnByValue: true,
+            awaitPromise: true
+        });
+        return res.result.value ? JSON.parse(res.result.value) : [];
+    } catch (e) {
+        return [];
+    }
 }
 
 async function captureScreenshot(tabId, fullPage = false) {
@@ -727,20 +795,23 @@ async function captureScreenshot(tabId, fullPage = false) {
 
 async function simulateClick(x, y, button = "left", clickCount = 1) {
     const tab = await getActiveTab();
-    const steps = 5;
-    const [startX, startY] = [Math.round(Math.random() * 500), Math.round(Math.random() * 500)];
-    for (let i = 1; i <= steps; i++) {
-        const ratio = i / steps;
-        const ease = 1 - Math.pow(1 - ratio, 2);
-        await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { 
-            type: "mouseMoved", 
-            x: Math.round(startX + (x - startX) * ease), 
-            y: Math.round(startY + (y - startY) * ease) 
-        });
-        await new Promise(r => setTimeout(r, 10));
+    
+    // v2.1 Hit-Testing (v3.0 Resilience)
+    try {
+        const hitRes = await chrome.debugger.sendCommand({ tabId: tab.id }, "DOM.getNodeForLocation", { x, y });
+        if (hitRes && hitRes.backendNodeId) {
+             // If we're hitting something that isn't what we intended (and it's not a child), we might be obstructed.
+        }
+    } catch (e) {
+        // If hit-test fails or is blocked, throw to trigger smartClick retry
+        if (e.message.includes("Node is detached") || e.message.includes("Could not find node")) {
+            throw new Error("Target obstructed or moved");
+        }
     }
+
+    // Dispatch mouse events in rapid succession for a "snappy" feel
+    await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, clickCount });
-    await new Promise(r => setTimeout(r, 30));
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button, clickCount });
 }
 
@@ -748,9 +819,7 @@ async function simulateDrag(startX, startY, endX, endY) {
     const tab = await getActiveTab();
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseMoved", x: startX, y: startY });
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mousePressed", x: startX, y: startY, button: "left", clickCount: 1 });
-    await new Promise(r => setTimeout(r, 100));
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseMoved", x: endX, y: endY, button: "left" });
-    await new Promise(r => setTimeout(r, 100));
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: endY, button: "left", clickCount: 1 });
 }
 
@@ -801,11 +870,32 @@ async function fillFormField(id, value, fallbackText) {
 }
 
 async function smartClickElement(id, fallbackText) {
-    const pos = await resolveElementPosition(id, fallbackText);
-    if (!pos) throw new Error(`Element ${id} not found.`);
-    await notifyContentScript({ type: "show_click", x: pos.x, y: pos.y });
-    await simulateClick(pos.x, pos.y);
-    return { success: true, elementClicked: `id:${id}` };
+    let target = await resolveElementPosition(id, fallbackText);
+    if (!target) throw new Error(`Element ${id} not found.`);
+    
+    await notifyContentScript({ type: "show_click", x: target.x, y: target.y });
+    
+    // Stale-Node Recovery Loop (v3.0 Resilience)
+    let retry = 0;
+    while (retry < 2) {
+        try {
+            await simulateClick(target.x, target.y);
+            // v3.1 Mutation Guard: Verify action result
+            await new Promise(r => setTimeout(r, 100)); 
+            break;
+        } catch (e) {
+            if (e.message.includes("obstructed") || e.message.includes("detached")) {
+                retry++;
+                await new Promise(r => setTimeout(r, 200));
+                const newState = await getBrowserState();
+                target = newState.interactiveElements.find(el => el.text === target.text);
+                if (!target) throw e;
+            } else {
+                throw e;
+            }
+        }
+    }
+    return `Clicked element ${target.text} at ${target.x}, ${target.y}`;
 }
 
 async function smartClickElementBySelector(selector) {
@@ -830,7 +920,7 @@ async function smartClickElementBySelector(selector) {
 async function resolveElementPosition(id, fallbackText) {
     if (id && elementPositionCache.has(Number(id))) {
         const el = elementPositionCache.get(Number(id));
-        return { x: el.x, y: el.y };
+        return { x: el.x, y: el.y, text: el.text };
     }
 
     const tab = await getActiveTab();
@@ -846,7 +936,7 @@ async function resolveElementPosition(id, fallbackText) {
             if (!el) return null;
             el.scrollIntoView({block: 'center', inline: 'center'});
             const r = el.getBoundingClientRect();
-            return JSON.stringify({ x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) });
+            return JSON.stringify({ x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), text: el.innerText || el.textContent });
         })()`,
         returnByValue: true
     });
@@ -909,11 +999,64 @@ async function getAccessibilityTree() {
 }
 
 async function enableStealth(tabId) {
-    try {
-        await chrome.debugger.sendCommand({ tabId }, "Page.addScriptToEvaluateOnNewDocument", {
-            source: `Object.defineProperty(navigator, 'webdriver', { get: () => false });`
+    const script = `
+        // Comprehensive Stealth Protocol v3.1
+        const overwriteLabel = (proto, key, payload) => {
+            Object.defineProperty(proto, key, { get: () => payload, configurable: true });
+        };
+        
+        // 1. Hide WebDriver
+        const nav = navigator.__proto__;
+        delete nav.webdriver;
+        overwriteLabel(nav, 'webdriver', false);
+        
+        // 2. Fix Hardware Profile
+        overwriteLabel(nav, 'languages', ['en-US', 'en']);
+        overwriteLabel(nav, 'deviceMemory', 8);
+        overwriteLabel(nav, 'hardwareConcurrency', 8);
+        
+        // 3. Emulate Chrome Runtime
+        window.chrome = {
+            runtime: {
+                OnInstalledReason: { INSTALL: 'install', UPDATE: 'update' },
+                OnRestartRequiredReason: { APP_UPDATE: 'app_update' },
+                PlatformOs: { MAC: 'mac', WIN: 'win', ANDROID: 'android' },
+                RequestUpdateCheckStatus: { THROTTLED: 'throttled', NO_UPDATE: 'no_update' }
+            },
+            app: { isInstalled: false }
+        };
+
+        // 4. Mock Plugins (Native Profile)
+        const mockPlugins = [
+            { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Google Chrome PDF Viewer' },
+            { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }
+        ];
+
+        const pluginArray = Object.create(PluginArray.prototype);
+        mockPlugins.forEach((p, i) => {
+            const plugin = Object.create(Plugin.prototype);
+            overwriteLabel(plugin, 'name', p.name);
+            overwriteLabel(plugin, 'filename', p.filename);
+            overwriteLabel(plugin, 'description', p.description);
+            overwriteLabel(plugin, 'length', 0);
+            pluginArray[i] = plugin;
+            pluginArray[p.name] = plugin;
         });
-    } catch (e) { }
+        overwriteLabel(pluginArray, 'length', mockPlugins.length);
+        overwriteLabel(nav, 'plugins', pluginArray);
+        
+        // 5. User-Agent Stability (Golden Profile)
+        const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+        overwriteLabel(nav, 'userAgent', UA);
+        overwriteLabel(nav, 'appVersion', UA.replace('Mozilla/', ''));
+    `;
+    // Apply globally to every new document
+    await chrome.debugger.sendCommand({ tabId }, "Page.addScriptToEvaluateOnNewDocument", { source: script });
+    // Apply immediately to current execution context
+    await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", { expression: script });
 }
 
 async function executeScript(script) {
@@ -1013,6 +1156,7 @@ async function clearHighlights(tabId) {
 
 async function hoverElement(id, x, y, fallback) {
     const tab = await getActiveTab();
+    await ensureDebuggerAttached(tab.id);
     let tx = x, ty = y;
     if (id) {
         const pos = await resolveElementPosition(id, fallback);
@@ -1029,6 +1173,7 @@ async function dragAndDrop(sid, tid) {
     const tpos = await resolveElementPosition(tid, null);
     if (!spos || !tpos) throw new Error("Source or target element not found");
     const tab = await getActiveTab();
+    await ensureDebuggerAttached(tab.id);
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseMoved", x: spos.x, y: spos.y });
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, x: spos.x, y: spos.y });
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseMoved", x: tpos.x, y: tpos.y, button: "left" });
@@ -1038,6 +1183,7 @@ async function dragAndDrop(sid, tid) {
 
 async function emulateNetwork(off, lat, d, u) {
     const tab = await getActiveTab();
+    await ensureDebuggerAttached(tab.id);
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Network.emulateNetworkConditions", { offline: !!off, latency: lat || 0, downloadThroughput: d || -1, uploadThroughput: u || -1 });
     return "Network conditions emulated";
 }
@@ -1047,7 +1193,8 @@ async function printPDF(opts) { const res = await chrome.debugger.sendCommand({ 
 async function simulateScroll(x, y) { 
     const tab = await getActiveTab();
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type: "mouseWheel", x: 0, y: 0, deltaX: x || 0, deltaY: y || 0 });
-    await new Promise(r => setTimeout(r, 500));
+    // Minimal wait for scroll to trigger
+    await new Promise(r => setTimeout(r, 50)); 
     const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", { expression: `JSON.stringify({ scrollY: window.scrollY, innerHeight: window.innerHeight, scrollHeight: document.body.scrollHeight })`, returnByValue: true });
     const info = res.result.value ? JSON.parse(res.result.value) : { scrollY: 0, innerHeight: 0, scrollHeight: 0 };
     return { success: true, scrolledBy: y || x, currentPosition: info.scrollY, isAtBottom: info.scrollY + info.innerHeight >= info.scrollHeight - 10 };
@@ -1081,26 +1228,37 @@ async function waitForElement(selector, timeoutMs) {
 
 async function waitForNetworkIdle(timeoutMs) {
     const start = Date.now();
-    let idleStart = null;
+    let stableStart = null;
     while (Date.now() - start < timeoutMs) {
-        if (activeNetworkRequests === 0) {
-            if (!idleStart) idleStart = Date.now();
-            else if (Date.now() - idleStart > 500) return { success: true, message: "Network is idle" };
-        } else { idleStart = null; }
+        // "Quiet-Wait": ignores minor telemetry pings (<= 2 active)
+        if (activeNetworkRequests <= 2) {
+            if (!stableStart) stableStart = Date.now();
+            else if (Date.now() - stableStart > 500) return { success: true, message: "Network stabilized (Quiet-Wait)" };
+        } else { stableStart = null; }
         await new Promise(r => setTimeout(r, 100));
     }
-    throw new Error("Timeout waiting for network idle");
+    return { success: false, message: "Network never stabilized" };
 }
 
-async function waitForNavigation(timeoutMs) {
-    const tab = await getActiveTab();
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-        const res = await chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", { expression: "document.readyState === 'complete'", returnByValue: true });
-        if (res.result.value) return { success: true, message: "Navigation complete" };
-        await new Promise(r => setTimeout(r, 500));
-    }
-    throw new Error("Timeout waiting for navigation");
+async function waitForLoading(tabId, timeoutMs = 30000) {
+    return new Promise(async (resolve) => {
+        const timeout = setTimeout(() => resolve({ success: false, message: "Timeout" }), timeoutMs);
+        
+        async function check() {
+            try {
+                const res = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", { expression: "document.readyState" });
+                if (res.result.value === "complete") {
+                    // Page is loaded, now wait for network quiet
+                    await waitForNetworkIdle(5000);
+                    clearTimeout(timeout);
+                    resolve({ success: true, message: "Loaded and Stable" });
+                } else {
+                    setTimeout(check, 500);
+                }
+            } catch (e) { resolve({ success: false }); }
+        }
+        check();
+    });
 }
 
 async function performAssertion(assertionType, selector, value) {

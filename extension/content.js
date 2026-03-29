@@ -77,17 +77,27 @@
                 border: 1px solid rgba(59, 130, 246, 0.4);
                 color: #93c5fd;
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                font-size: 12px;
-                font-weight: 600;
+                font-size: 11px;
+                font-weight: 700;
                 letter-spacing: 0.5px;
                 pointer-events: none;
                 animation: mcp-badge-slide-in 0.4s ease, mcp-badge-pulse 2s ease-in-out infinite;
                 opacity: 0;
                 transition: opacity 0.3s ease;
+                text-transform: uppercase;
             }
 
             #mcp-agent-badge.active {
                 opacity: 1;
+            }
+
+            #mcp-agent-badge .mcp-v2 {
+                background: #3b82f6;
+                color: white;
+                padding: 1px 4px;
+                border-radius: 3px;
+                font-size: 9px;
+                margin-right: 4px;
             }
 
             #mcp-agent-badge .mcp-dot {
@@ -163,7 +173,7 @@
             if (!badgeEl) {
                 badgeEl = document.createElement("div");
                 badgeEl.id = "mcp-agent-badge";
-                badgeEl.innerHTML = '<span class="mcp-dot"></span> <span id="mcp-badge-text">Agent Controlled</span>';
+                badgeEl.innerHTML = '<span class="mcp-v2">V2</span> <span class="mcp-dot"></span> <span id="mcp-badge-text">IDLE</span>';
                 document.body.appendChild(badgeEl);
             }
         }

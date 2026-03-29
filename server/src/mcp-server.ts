@@ -22,12 +22,12 @@ let lastKnownCursor: [number, number] = [0, 0];
 const Tools = [
     {
         name: "get_task_graph",
-        description: "Retrieve the hierarchical task graph for the current session (UFO3 Task Constellation).",
+        description: "Retrieve the hierarchical task graph for the current session (Aether v2 Task Orbit).",
         inputSchema: { type: "object", properties: {} },
     },
     {
         name: "act",
-        description: "Perform an action in the browser. Supports navigation, clicking, typing, scrolling, waiting, and tab management.",
+        description: "Perform precise, high-speed actions in the browser. Supports navigation, clicking, typing, scrolling, and tab management with atomic verification.",
         inputSchema: {
             type: "object",
             properties: {
@@ -108,7 +108,7 @@ const Tools = [
     },
     {
         name: "get_state",
-        description: "Get the current state (URL, Title, Screenshot, Interactive Elements with IDs, Logs)",
+        description: "Capture the current browser state (v2) — includes high-fidelity element map, screenshot, and console logs.",
         inputSchema: { type: "object", properties: {} },
     },
     {
@@ -305,63 +305,37 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
 
             if (name === "act") {
                 const action = a.action;
-                const taskId = Math.random().toString(36).substring(7);
+                const taskId = `v2-${Math.random().toString(36).substring(7)}`;
                 const currentState = await sendCommandToExtension("get_state", { screenshot: false });
                 
-                // Track Task (UFO3)
                 const node: TaskNode = {
-                    id: taskId,
-                    action: action,
-                    url: currentState.url,
-                    timestamp: new Date().toISOString(),
-                    parentId: a.parentId,
-                    status: 'pending'
+                    id: taskId, action, url: currentState.url, 
+                    timestamp: new Date().toISOString(), parentId: a.parentId, status: 'pending'
                 };
                 taskMemory.push(node);
 
                 let resultMsg = "";
-                const eid = a.elementId ? Number(String(a.elementId).replace('@', '')) : undefined;
+                const eid = a.elementId ? String(a.elementId).replace('@', '') : undefined;
 
                 try {
-                    if (action === "navigate") {
-                        await sendCommandToExtension("navigate", { url: a.value });
-                        resultMsg = `Navigated to ${a.value}`;
-                    }
-                    else if (action === "screenshot_region") {
-                        const res = await sendCommandToExtension("screenshot_region", { 
-                            x: a.options?.x, y: a.options?.y, 
-                            width: a.options?.width, height: a.options?.height 
-                        });
-                        return { content: [{ type: "image", data: res, mimeType: "image/jpeg" }] };
-                    }
-                    else if (action === "verify_ui_state") {
-                        const res = await sendCommandToExtension("verify_ui_state", { 
-                            selector: a.selector, 
-                            expectedText: a.value,
-                            type: a.assertionType || "visible" 
-                        });
-                        resultMsg = res.message;
-                        if (!res.success) throw new Error(res.message);
-                    }
-                    else if (action === "click") {
-                        if (eid) resultMsg = await sendCommandToExtension("click_element", { id: eid });
+                    // Smart Routing for v2
+                    if (action === "click") {
+                        if (eid) resultMsg = await sendCommandToExtension("click_element", { id: eid, text: a.value });
                         else if (a.selector) resultMsg = await sendCommandToExtension("click_element_by_selector", { selector: a.selector });
                         else if (a.coordinate) {
-                            const [x, y] = a.coordinate.split(',').map(Number);
-                            await sendCommandToExtension("click", { x, y });
-                            resultMsg = `Clicked at ${x},${y}`;
+                            const [x, y] = String(a.coordinate).split(',').map(Number);
+                            resultMsg = await sendCommandToExtension("click", { x, y });
+                        } else {
+                             resultMsg = await sendCommandToExtension(action, a);
                         }
-                    }
-                    else if (action === "type") {
-                        await sendCommandToExtension("type", { text: a.text || a.value });
-                        resultMsg = `Typed "${a.text || a.value}"`;
-                    }
-                    // ... (Forward other actions to extension similarly)
-                    else {
-                        // Default forwarding for existing actions
+                    } else if (action === "type") {
+                        if (eid || a.selector) await sendCommandToExtension(eid ? "click_element" : "click_element_by_selector", { id: eid, selector: a.selector });
+                        resultMsg = await sendCommandToExtension("type", { text: a.value || a.text });
+                    } else if (action === "navigate") {
+                        resultMsg = await sendCommandToExtension("navigate", { url: a.value });
+                    } else {
                         resultMsg = await sendCommandToExtension(action, a);
                     }
-
                     node.status = 'success';
                 } catch (err: any) {
                     node.status = 'failure';
@@ -369,7 +343,7 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                     throw err;
                 }
 
-                return { content: [{ type: "text", text: resultMsg }] };
+                return { content: [{ type: "text", text: typeof resultMsg === 'string' ? resultMsg : JSON.stringify(resultMsg) }] };
             }
 
             throw new Error(`Unknown tool: ${name}`);

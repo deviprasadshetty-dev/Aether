@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aether - AI Browser Controller</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header class="header">
+        <div class="header-inner">
+            <div class="logo">
+                <span class="logo-icon">#</span> Aether.
+            </div>
+            
+            <nav class="nav">
+                <a href="#home" class="nav-item active">Home</a>
+                <a href="#features" class="nav-item">Features</a>
+                <a href="#architecture" class="nav-item">Architecture</a>
+                <a href="#capabilities" class="nav-item">Capabilities</a>
+                <a href="#docs" class="nav-item">Docs</a>
+            </nav>
+            
+            <a href="#install" class="btn btn-primary btn-round">Install Server</a>
+        </div>
+    </header>
+
+    <main>
+        <!-- Hero Section -->
+        <section id="home" class="hero">
+            <div class="hero-content">
+                <div class="label">AETHER BROWSER CONTROLLER</div>
+                <h1 class="hero-title">
+                    The Future of<br>
+                    AI Browser Control<br>
+                    Made Simple <span class="asterisk">*</span>
+                </h1>
+                <p class="hero-subtitle">
+                    A high-performance Model Context Protocol (MCP) server delivering native precision and autonomous browser control for advanced AI agents.
+                </p>
+                <div class="hero-actions">
+                    <a href="#docs" class="btn btn-outline btn-pill">View Documentation &rarr;</a>
+                    <a href="#demo" class="btn btn-primary btn-pill">
+                        <span class="play-icon">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                        </span> 
+                        Watch Demo (1:24)
+                    </a>
+                </div>
+                <div class="scroll-down">
+                    <span class="mouse-icon">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="2" width="14" height="20" rx="7"/><path d="M12 6v4"/></svg>
+                    </span> 
+                    Scroll down for features
+                </div>
+            </div>
+            <div class="hero-illustration">
+                <div class="mockup-card sales-card">
+                    <div class="card-title">Set-of-Marks UI</div>
+                    <div class="chart-bars" style="flex-direction: column; gap: 8px; align-items: stretch; height: auto; padding-top: 0;">
+                        <div class="ui-element">
+                            <span>Submit Button</span> <span class="badge">@12</span>
+                        </div>
+                        <div class="ui-element">
+                            <span>Search Input</span> <span class="badge">@14</span>
+                        </div>
+                        <div class="ui-element">
+                            <span>Nav Link</span> <span class="badge">@18</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="mockup-card jobs-card">
+                    <div class="card-title">Recent Actions</div>
+                    <div class="job-list">
+                        <div class="job-item">
+                            <div class="job-icon blue"></div>
+                            <div class="job-details">
+                                <div class="job-time">act(click, @12)</div>
+                                <div class="job-clock">Success - 32ms</div>
+                            </div>
+                        </div>
+                        <div class="job-item">
+                            <div class="job-icon orange"></div>
+                            <div class="job-details">
+                                <div class="job-time">act(type, "Hello")</div>
+                                <div class="job-clock">Success - 45ms</div>
+                            </div>
+                        </div>
+                        <div class="job-item">
+                            <div class="job-icon red"></div>
+                            <div class="job-details">
+                                <div class="job-time">get_state()</div>
+                                <div class="job-clock">Captured - 120ms</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Logos Section -->
+        <section class="teams-section">
+            <div class="teams-header">
+                <h2>Empowering the next generation of <span>AI Agents</span></h2>
+            </div>
+            <div class="logos-grid">
+                <div class="logo-card">Claude 3.5</div>
+                <div class="logo-card">GPT-4o</div>
+                <div class="logo-card">Gemini 1.5</div>
+                <div class="logo-card">Llama 3</div>
+                <div class="logo-card">Mistral</div>
+            </div>
+        </section>
+
+        <!-- Content Section (Capabilities) -->
+        <section id="capabilities" class="content-section">
+            <div class="content-left">
+                <div class="label">CORE CAPABILITIES</div>
+                <h2 class="section-title">Provide native precision<br>at all times.</h2>
+                <p class="section-subtitle">
+                    Embrace a world of zero-shot accuracy. Aether equips agents with visual grounding, hierarchical task memory, and self-healing DOM interactions.
+                </p>
+                
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <div class="stat-header">
+                            <span class="stat-icon svg-icon">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                            </span>
+                            <span class="stat-value">Native</span>
+                        </div>
+                        <p class="stat-desc">CDP-powered typing and clicking instead of unreliable DOM emulation.</p>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-header">
+                            <span class="stat-icon svg-icon orange">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                            </span>
+                            <span class="stat-value">100%</span>
+                        </div>
+                        <p class="stat-desc">Self-healing locators automatically recover from UI shifts and updates.</p>
+                    </div>
+                </div>
+            </div>
+            <div class="content-right">
+                <div class="dashboard-mockup">
+                    <div class="icon-circle">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 3a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3H6a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3V6a3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3h12a3 3 0 0 0 3-3 3 3 0 0 0-3-3z"/></svg>
+                    </div>
+                    <div class="visitors-card">
+                        <div class="v-title">Task Constellation</div>
+                        <div class="v-value">UFO3 Graph <span class="v-trend">Active</span></div>
+                        <div class="v-footer">View Hierarchy</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Architecture Section -->
+        <section id="architecture" class="features-section">
+            <div class="features-header" style="grid-template-columns: 1fr;">
+                <h2 class="section-title">System Architecture</h2>
+                <p class="section-subtitle" style="max-width: 800px;">
+                    A dual-layer approach. A local Node.js MCP server provides the interface to your AI Agent (via stdio JSON-RPC), while a Chrome Extension Service Worker executes the CDP commands directly within the browser, delivering the visual overlay and real-time execution.
+                </p>
+            </div>
+            <div class="architecture-diagram" style="background: var(--bg-white); border: 1px solid var(--border-color); border-radius: 24px; padding: 3rem; overflow-x: auto;">
+                <pre style="font-family: monospace; font-size: 14px; line-height: 1.5; color: var(--text-black);">
+┌─────────────────────┐
+│   AI Agent (MCP)    │
+│  (Claude, etc.)     │
+└─────────┬───────────┘
+          │ stdio (JSON-RPC)
+┌─────────▼───────────┐
+│   Aether MCP Server │
+│   (Node.js + TS)    │
+│   Port 3010: Health │
+└─────────┬───────────┘
+          │ WebSocket (Port 3009)
+┌─────────▼───────────┐
+│  Chrome Extension   │
+│  (Service Worker)   │
+│  ┌────────────────┐ │
+│  │ CDP Commands   │ │
+│  │ Visual Overlay │ │
+│  └────────────────┘ │
+└─── Network/Fetch ───┘
+                </pre>
+            </div>
+        </section>
+
+        <!-- Features Section -->
+        <section id="features" class="features-section">
+            <div class="features-header">
+                <h2 class="section-title">Learn about Aether and<br>core features</h2>
+                <p class="section-subtitle">
+                    We believe in pushing the boundaries of autonomous systems. Aether embodies this philosophy with a suite of tools built for sophisticated agents.
+                </p>
+            </div>
+            
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="f-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
+                    </div>
+                    <h3 class="f-title">Set-of-Marks</h3>
+                    <p class="f-desc">Interactive elements are assigned unique IDs for precise, zero-shot clicking by vision models.</p>
+                    <ul class="f-list">
+                        <li><span class="check"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg></span> Visual numbered badges</li>
+                        <li><span class="check"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg></span> Bypasses volatile HTML</li>
+                    </ul>
+                </div>
+                <div class="feature-card">
+                    <div class="f-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+                    </div>
+                    <h3 class="f-title">State Capture</h3>
+                    <p class="f-desc">Everything the agent needs to perceive the page in a single, comprehensive get_state payload.</p>
+                    <ul class="f-list">
+                        <li><span class="check"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg></span> High-fidelity screenshots</li>
+                        <li><span class="check"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg></span> Console and network logs</li>
+                    </ul>
+                </div>
+                <div class="feature-card">
+                    <div class="f-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><path d="M8 16h8"/></svg>
+                    </div>
+                    <h3 class="f-title">Computer Use</h3>
+                    <p class="f-desc">Native integration with Anthropic's Computer Use API schema for genuine operating system-level control.</p>
+                    <ul class="f-list">
+                        <li><span class="check"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg></span> Coordinate mouse actions</li>
+                        <li><span class="check"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg></span> Native keyboard events</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <!-- Install & Docs Section -->
+        <section id="docs" class="features-section">
+            <div class="features-header" style="grid-template-columns: 1fr;">
+                <h2 id="install" class="section-title">Quick Start Installation</h2>
+                <p class="section-subtitle">
+                    Get the Aether MCP Server and Chrome Extension up and running in minutes.
+                </p>
+            </div>
+            
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 2rem;">
+                <div class="feature-card" style="background-image: none;">
+                    <div class="f-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+                    </div>
+                    <h3 class="f-title">1. Build the Server</h3>
+                    <p class="f-desc">Clone the repository and build the local Node.js MCP server.</p>
+                    <div style="background: #111; color: #fff; padding: 1rem; border-radius: 8px; font-family: monospace; font-size: 0.85rem; line-height: 1.5; margin-bottom: 1rem;">
+                        cd server<br>
+                        npm install<br>
+                        npm run build
+                    </div>
+                </div>
+
+                <div class="feature-card" style="background-image: none;">
+                    <div class="f-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg>
+                    </div>
+                    <h3 class="f-title">2. Load the Extension</h3>
+                    <p class="f-desc">Install the local Chrome extension to enable visual grounding and CDP commands.</p>
+                    <ul class="f-list">
+                        <li><span class="check"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg></span> Open <code style="background: #f0f0f0; padding: 2px 4px; border-radius: 4px;">chrome://extensions</code></li>
+                        <li><span class="check"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg></span> Enable Developer Mode</li>
+                        <li><span class="check"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg></span> Click "Load Unpacked" and select the <code style="background: #f0f0f0; padding: 2px 4px; border-radius: 4px;">extension/</code> folder</li>
+                    </ul>
+                </div>
+
+                <div class="feature-card" style="background-image: none;">
+                    <div class="f-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12h4l3-9 5 18 3-9h5"/></svg>
+                    </div>
+                    <h3 class="f-title">3. Configure MCP Client</h3>
+                    <p class="f-desc">Add Aether to your AI client (like Claude Desktop).</p>
+                    <div style="background: #111; color: #fff; padding: 1rem; border-radius: 8px; font-family: monospace; font-size: 0.85rem; line-height: 1.5; overflow-x: auto;">
+"mcpServers": {
+  "aether-browser": {
+    "command": "node",
+    "args": ["path/to/server/dist/index.js"]
+  }
+}
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </main>
+    <script src="script.js"></script>
+</body>
+</html>
