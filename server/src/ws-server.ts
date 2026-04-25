@@ -5,22 +5,16 @@ export let activeConnection: WebSocket | null = null;
 let messageIdCounter = 0;
 const pendingRequests = new Map<number, { resolve: (val: any) => void; reject: (err: any) => void }>();
 
-const HEALTH_PORT_OFFSET = 1; // Health endpoint runs on WS_PORT + 1
-
 /**
  * Ensure port is available by killing any stale server
  */
 export async function ensurePortAvailable(port: number): Promise<void> {
     return new Promise((resolve) => {
-        // Try to connect to the health endpoint of an existing server
-        const healthPort = port + HEALTH_PORT_OFFSET;
-        const req = http.get(`http://localhost:${healthPort}/shutdown`, (res) => {
+        const req = http.get(`http://localhost:${port}/shutdown`, (res) => {
             console.error(`[WS] Sent shutdown to existing server on port ${port}`);
-            // Wait for it to die
             setTimeout(resolve, 1500);
         });
         req.on("error", () => {
-            // No existing server — port is free or ghost-locked
             resolve();
         });
         req.setTimeout(2000, () => {
@@ -31,11 +25,10 @@ export async function ensurePortAvailable(port: number): Promise<void> {
 }
 
 export function StartWebSocketServer(port: number) {
-    const wss = new WebSocketServer({ port });
+    let retryCount = 0;
+    const MAX_RETRIES = 3;
 
-    // --- Health / Shutdown HTTP server ---
-    const healthPort = port + HEALTH_PORT_OFFSET;
-    const healthServer = http.createServer((req, res) => {
+    const server = http.createServer((req, res) => {
         if (req.url === "/health") {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({
@@ -53,19 +46,19 @@ export function StartWebSocketServer(port: number) {
             res.end();
         }
     });
-    healthServer.listen(healthPort, () => {
-        console.error(`[WS] Health endpoint on port ${healthPort}`);
-    });
-    healthServer.on("error", (err: any) => {
-        console.error(`[WS] Health server error: ${err.message}`);
-    });
 
-    // --- WebSocket Server ---
-    wss.on("error", (err: any) => {
+    const wss = new WebSocketServer({ server });
+
+    server.on("error", (err: any) => {
         if (err.code === "EADDRINUSE") {
-            console.error(`[WS] Port ${port} in use. Will retry after shutdown...`);
+            if (retryCount >= MAX_RETRIES) {
+                console.error(`[WS] Port ${port} in use. Max retries reached. Exiting.`);
+                process.exit(1);
+            }
+            retryCount++;
+            console.error(`[WS] Port ${port} in use. Retry ${retryCount}/${MAX_RETRIES} after 2s...`);
             setTimeout(() => {
-                wss.close();
+                server.close();
                 StartWebSocketServer(port);
             }, 2000);
         } else {
@@ -73,8 +66,9 @@ export function StartWebSocketServer(port: number) {
         }
     });
 
-    wss.on("listening", () => {
-        console.error(`[WS] WebSocket Server listening on port ${port}`);
+    server.listen(port, () => {
+        console.error(`[WS] HTTP/WebSocket Server listening on port ${port}`);
+        retryCount = 0; // Reset on success
     });
 
     wss.on("connection", (ws) => {

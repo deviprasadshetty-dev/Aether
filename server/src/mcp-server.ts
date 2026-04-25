@@ -1,9 +1,8 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { sendCommandToExtension } from "./ws-server";
-import * as fs from "fs";
-import * as path from "path";
+import { getCdpBridge } from "./cdp-bridge";
+import { getCdpClient } from "./cdp-client";
 
 interface TaskNode {
     id: string;
@@ -17,7 +16,7 @@ interface TaskNode {
 
 const taskMemory: TaskNode[] = [];
 const sessionHistory: any[] = [];
-let lastKnownCursor: [number, number] = [0, 0];
+const MAX_MEMORY = 100;
 
 const Tools = [
     {
@@ -42,7 +41,9 @@ const Tools = [
                         "start_screencast", "stop_screencast", "record_session",
                         "mock_network_request", "generate_artifact", "highlight_elements",
                         "assert", "start_tracing", "stop_tracing", "target_auto_attach", "enable_domain", "pause", "resume",
-                        "screenshot_region", "verify_ui_state"
+                        "screenshot_region", "verify_ui_state", "get_dom_snapshot", "get_event_listeners",
+                        "get_computed_style", "get_network_traffic", "get_network_response",
+                        "get_screencast_frames", "get_dom_storage"
                     ],
                     description: "The action to perform."
                 },
@@ -78,6 +79,7 @@ const Tools = [
                 urlPattern: { type: "string", description: "URL pattern to mock (e.g., '*api.example.com*')" },
                 mockResponse: { type: "string", description: "Stringified JSON to return as mocked response" },
                 markdownSummary: { type: "string", description: "Summary text for the artifact" },
+                requestId: { type: "string", description: "Request ID for get_network_response" },
 
                 // Network Emulation params
                 offline: { type: "boolean" },
@@ -133,26 +135,170 @@ const Tools = [
         }
     },
     {
-        name: "computer_20241022",
-        description: "Native Anthropic Computer Use API implementation for zero-shot browser control.",
+        name: "connect_browser",
+        description: "Connect to browser. Auto-detects and launches available browser if not connected.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                mode: { type: "string", enum: ["connect", "launch", "auto"], description: "Connect to existing or launch new instance (auto = detect & launch)." },
+                port: { type: "number", description: "Browser debugging port (default: 9222)." },
+                headless: { type: "boolean", description: "Run in headless mode (only for launch mode)." },
+                browser: { type: "string", enum: ["chrome", "edge", "brave", "firefox"], description: "Browser to use (default: auto-detect)." }
+            }
+        }
+    },
+    {
+        name: "launch_browser",
+        description: "Launch a browser (auto-detects available browsers if not specified).",
+        inputSchema: {
+            type: "object",
+            properties: {
+                browser: { type: "string", enum: ["chrome", "edge", "brave", "firefox"], description: "Browser to launch (default: auto-detect first available)." },
+                headless: { type: "boolean", description: "Run in headless mode." },
+                port: { type: "number", description: "Debugging port (default: 9222)." }
+            }
+        }
+    },
+    {
+        name: "kill_browser",
+        description: "Kill the launched browser process when done.",
+        inputSchema: { type: "object", properties: {} }
+    },
+    {
+        name: "list_browsers",
+        description: "List all available browsers on the system.",
+        inputSchema: { type: "object", properties: {} }
+    },
+    // ==================== AGENT-CENTRIC APIs ====================
+    {
+        name: "agent_action",
+        description: "Execute an action and optionally verify UI state. Unified action API that combines action + wait + verify in one call. Returns screenshot after action.",
         inputSchema: {
             type: "object",
             properties: {
                 action: {
                     type: "string",
-                    enum: [
-                        "key", "type", "mouse_move", "left_click", 
-                        "left_click_drag", "right_click", "middle_click", 
-                        "double_click", "screenshot", "cursor_position"
-                    ]
+                    enum: ["click", "type", "scroll", "hover", "drag", "key_press"],
+                    description: "Action to perform."
                 },
-                coordinate: {
-                    type: "array",
-                    items: { type: "number" }
+                target: {
+                    type: "object",
+                    properties: {
+                        id: { type: "string", description: "Element ID from page_snapshot" },
+                        selector: { type: "string", description: "CSS selector" },
+                        text: { type: "string", description: "Text to match" },
+                        x: { type: "number", description: "X coordinate" },
+                        y: { type: "number", description: "Y coordinate" },
+                        button: { type: "string", enum: ["left", "middle", "right"] },
+                        clickCount: { type: "number" },
+                        key: { type: "string", description: "Key to press" },
+                        modifiers: { type: "array", items: { type: "string" } }
+                    }
                 },
-                text: { type: "string" }
+                verify: {
+                    type: "object",
+                    properties: {
+                        selector: { type: "string" },
+                        expectedText: { type: "string" },
+                        type: { type: "string", enum: ["element_exists", "element_contains_text", "text_match", "element_visible"] }
+                    }
+                },
+                waitFor: {
+                    type: "object",
+                    properties: {
+                        type: { type: "string", enum: ["network_idle", "element", "navigation"] },
+                        selector: { type: "string" },
+                        timeout: { type: "number" }
+                    }
+                },
+                timeout: { type: "number", description: "Timeout in ms (default: 10000)" }
+            },
+            required: ["action", "target"]
+        }
+    },
+    {
+        name: "smart_navigate",
+        description: "Navigate to URL with built-in waiting for page stability. Auto-dismisses popups. Returns screenshot of loaded page.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                url: { type: "string", description: "URL to navigate to." },
+                waitFor: {
+                    type: "object",
+                    properties: {
+                        type: { type: "string", enum: ["element", "network_idle"] },
+                        selector: { type: "string" },
+                        timeout: { type: "number" }
+                    }
+                },
+                dismissPopups: { type: "boolean", description: "Auto-dismiss popups (default: true)" },
+                screenshot: { type: "boolean", description: "Return screenshot (default: true)" },
+                timeout: { type: "number", description: "Navigation timeout in ms (default: 30000)" }
+            },
+            required: ["url"]
+        }
+    },
+    {
+        name: "observe_and_act",
+        description: "Execute an action and observe page state changes. Returns before/after snapshots to detect what changed.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                action: {
+                    type: "object",
+                    properties: {
+                        type: { type: "string", enum: ["click", "type"] },
+                        selector: { type: "string" },
+                        text: { type: "string" }
+                    }
+                },
+                observe: {
+                    type: "object",
+                    properties: {
+                        type: { type: "string", enum: ["dom_change", "network_response"] }
+                    }
+                },
+                returnScreenshot: { type: "boolean", description: "Return screenshots (default: true)" }
             },
             required: ["action"]
+        }
+    },
+    {
+        name: "agent_form_fill",
+        description: "Intelligently fill form fields. Auto-detects field types (text, select, checkbox, radio, file).",
+        inputSchema: {
+            type: "object",
+            properties: {
+                fields: {
+                    type: "array",
+                    items: {
+                        type: "object",
+                        properties: {
+                            id: { type: "string" },
+                            selector: { type: "string" },
+                            type: { type: "string", enum: ["text", "email", "password", "select", "checkbox", "radio", "file", "textarea"] },
+                            value: { type: "string" },
+                            checked: { type: "boolean" },
+                            files: { type: "array", items: { type: "string" } }
+                        }
+                    },
+                    description: "Form fields to fill."
+                },
+                submitAfterFill: { type: "boolean", description: "Submit form after filling (default: false)" },
+                submitSelector: { type: "string", description: "Selector for submit button" }
+            },
+            required: ["fields"]
+        }
+    },
+    {
+        name: "page_snapshot",
+        description: "Capture rich page context optimized for LLM consumption. Returns interactive elements, forms, network state, logs, cookies, and storage in one call.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                fullPage: { type: "boolean", description: "Full page screenshot (default: false)" },
+                includeDOMSnapshot: { type: "boolean", description: "Include full DOM snapshot (default: false)" }
+            }
         }
     }
 ];
@@ -163,178 +309,124 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { name, arguments: args } = request.params;
         const a = args as any;
+        const bridge = getCdpBridge();
 
         try {
             if (name === "get_task_graph") {
                 return { content: [{ type: "text", text: JSON.stringify(taskMemory, null, 2) }] };
             }
 
-            if (name === "computer_20241022") {
-                const action = a.action;
-                let resultMsg = "";
+            if (name === "connect_browser") {
+                const mode = a?.mode || "auto";
+                const port = a?.port || 9222;
                 
-                if (action === "screenshot") {
-                    const result = await sendCommandToExtension("get_state", {});
-                    return { content: [{ type: "image", data: result.screenshot, mimeType: "image/jpeg" }] };
-                } 
-                
-                else if (action === "cursor_position") {
-                    return { content: [{ type: "text", text: `Cursor position: ${lastKnownCursor[0]}, ${lastKnownCursor[1]}` }] };
+                if (mode === "connect") {
+                    await bridge.sendCommand("connect", { port });
+                    return { content: [{ type: "text", text: "Connected to browser successfully" }] };
+                } else if (mode === "launch") {
+                    const result = await bridge.launchBrowser({ 
+                        browser: a?.browser, 
+                        headless: a?.headless, 
+                        port 
+                    });
+                    return { content: [{ type: "text", text: result }] };
+                } else {
+                    // auto mode - detect and launch
+                    const result = await bridge.launchBrowser({ 
+                        browser: a?.browser, 
+                        headless: a?.headless, 
+                        port 
+                    });
+                    return { content: [{ type: "text", text: result }] };
                 }
+            }
 
-                else if (action === "left_click") {
-                    const coord = a.coordinate || lastKnownCursor;
-                    await sendCommandToExtension("click", { x: coord[0], y: coord[1], button: "left", clickCount: 1 });
-                    lastKnownCursor = [coord[0], coord[1]];
-                    resultMsg = `Left clicked at ${coord[0]}, ${coord[1]}`;
-                } 
-                
-                else if (action === "right_click") {
-                    const coord = a.coordinate || lastKnownCursor;
-                    await sendCommandToExtension("right_click", { x: coord[0], y: coord[1] });
-                    lastKnownCursor = [coord[0], coord[1]];
-                    resultMsg = `Right clicked at ${coord[0]}, ${coord[1]}`;
+            if (name === "launch_browser") {
+                const result = await bridge.launchBrowser({ 
+                    browser: a?.browser, 
+                    headless: a?.headless,
+                    port: a?.port 
+                });
+                return { content: [{ type: "text", text: result }] };
+            }
+
+            if (name === "kill_browser") {
+                const result = await bridge.killBrowser();
+                return { content: [{ type: "text", text: result }] };
+            }
+
+            if (name === "list_browsers") {
+                const browsers = await bridge.listBrowsers();
+                if (browsers.length === 0) {
+                    return { content: [{ type: "text", text: "No supported browsers found. Please install Chrome, Edge, Brave, or Firefox." }] };
                 }
-
-                else if (action === "middle_click") {
-                    const coord = a.coordinate || lastKnownCursor;
-                    await sendCommandToExtension("middle_click", { x: coord[0], y: coord[1] });
-                    lastKnownCursor = [coord[0], coord[1]];
-                    resultMsg = `Middle clicked at ${coord[0]}, ${coord[1]}`;
-                }
-
-                else if (action === "double_click") {
-                    const coord = a.coordinate || lastKnownCursor;
-                    await sendCommandToExtension("double_click", { x: coord[0], y: coord[1] });
-                    lastKnownCursor = [coord[0], coord[1]];
-                    resultMsg = `Double clicked at ${coord[0]}, ${coord[1]}`;
-                }
-
-                else if (action === "left_click_drag") {
-                    if (!a.coordinate) throw new Error("left_click_drag requires coordinate");
-                    const startX = lastKnownCursor[0];
-                    const startY = lastKnownCursor[1];
-                    const endX = a.coordinate[0];
-                    const endY = a.coordinate[1];
-                    await sendCommandToExtension("drag", { startX, startY, endX, endY });
-                    lastKnownCursor = [endX, endY];
-                    resultMsg = `Dragged from ${startX}, ${startY} to ${endX}, ${endY}`;
-                }
-
-                else if (action === "mouse_move") {
-                    if (a.coordinate) {
-                        await sendCommandToExtension("mouse_move", { x: a.coordinate[0], y: a.coordinate[1] });
-                        lastKnownCursor = [a.coordinate[0], a.coordinate[1]];
-                        resultMsg = `Mouse moved to ${a.coordinate[0]}, ${a.coordinate[1]}`;
-                    } else {
-                        throw new Error("mouse_move requires coordinate");
-                    }
-                } 
-                
-                else if (action === "type") {
-                    if (a.text) {
-                        await sendCommandToExtension("type", { text: a.text });
-                        resultMsg = `Typed: ${a.text}`;
-                    } else {
-                        throw new Error("type requires text");
-                    }
-                } 
-                
-                else if (action === "key") {
-                    if (a.text) {
-                        const parts = a.text.split('+');
-                        let key = parts.pop() || "";
-                        if (key === "Return") key = "Enter";
-                        const modifiers = parts.map((p: string) => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase());
-                        await sendCommandToExtension("press_key", { key, modifiers });
-                        resultMsg = `Pressed key ${a.text}`;
-                    } else {
-                        throw new Error("key requires text");
-                    }
-                } 
-                
-                else {
-                    resultMsg = `Action ${action} is recognized but not fully implemented.`;
-                }
-
-                return { content: [{ type: "text", text: resultMsg }] };
+                const list = browsers.map((b: any) => `${b.name}: ${b.path}`).join("\n");
+                return { content: [{ type: "text", text: `Available browsers:\n${list}` }] };
             }
 
             if (name === "get_state") {
-                const result = await sendCommandToExtension("get_state", {});
-                if (!result) throw new Error("Received empty state from extension");
-
-                const elementsSummary = result.interactiveElements
-                    ? result.interactiveElements.map((el: any) => {
-                        let desc = `[@${el.id}] ${el.tagName} "${el.text}"`;
-                        if (el.type) desc += ` type=${el.type}`;
-                        if (el.name) desc += ` name=${el.name}`;
-                        if (el.role) desc += ` role=${el.role}`;
-                        if (el.value) desc += ` value="${el.value}"`;
-                        if (el.checked !== undefined) desc += ` checked=${el.checked}`;
-                        if (el.disabled) desc += ` DISABLED`;
-                        if (el.x && el.y) desc += ` center=(${el.x},${el.y})`;
-                        return desc;
-                    }).join("\n")
-                    : "No elements found";
-
-                const tabsSummary = result.tabs
-                    ? "\n\nOpen Tabs:\n" + result.tabs.map((t: any) => `[${t.id}] ${t.title} ${t.active ? '(Active)' : ''}`).join("\n")
-                    : "";
+                const result = await bridge.sendCommand("get_state", {});
+                if (!result) throw new Error("Received empty state");
 
                 sessionHistory.unshift({ timestamp: new Date().toISOString(), title: result.title, url: result.url });
-                if (sessionHistory.length > 10) sessionHistory.pop();
+                if (sessionHistory.length > MAX_MEMORY) sessionHistory.pop();
 
-                return {
-                    content: [
-                        { type: "text", text: `Title: ${result.title}\nURL: ${result.url}${tabsSummary}\n\nInteractive Elements:\n${elementsSummary}` },
-                        { type: "image", data: result.screenshot, mimeType: "image/jpeg" }
-                    ],
-                };
+                const content: any[] = [
+                    { type: "text", text: `Title: ${result.title}\nURL: ${result.url}` },
+                ];
+                if (result.screenshot) {
+                    content.push({ type: "image", data: result.screenshot, mimeType: "image/jpeg" });
+                }
+
+                return { content };
             }
 
             if (name === "execute_script") {
-                const result = await sendCommandToExtension("evaluate", { script: String(a?.script) });
+                const result = await bridge.sendCommand("evaluate", { script: String(a?.script) });
                 return { content: [{ type: "text", text: `Result: ${JSON.stringify(result)}` }] };
             }
 
             if (name === "cdp_command") {
-                const result = await sendCommandToExtension("cdp_command", { command: a.command, args: a.args || {} });
+                const result = await bridge.sendCommand("cdp_command", { command: a.command, args: a.args || {} });
                 return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
             }
 
             if (name === "act") {
                 const action = a.action;
                 const taskId = `v2-${Math.random().toString(36).substring(7)}`;
-                const currentState = await sendCommandToExtension("get_state", { screenshot: false });
                 
+                let currentState = { url: "unknown" };
+                try {
+                    currentState = await bridge.sendCommand("get_state", { screenshot: false });
+                } catch {}
+
                 const node: TaskNode = {
                     id: taskId, action, url: currentState.url, 
                     timestamp: new Date().toISOString(), parentId: a.parentId, status: 'pending'
                 };
                 taskMemory.push(node);
+                if (taskMemory.length > MAX_MEMORY) taskMemory.shift();
 
                 let resultMsg = "";
                 const eid = a.elementId ? String(a.elementId).replace('@', '') : undefined;
-
+                
                 try {
-                    // Smart Routing for v2
                     if (action === "click") {
-                        if (eid) resultMsg = await sendCommandToExtension("click_element", { id: eid, text: a.value });
-                        else if (a.selector) resultMsg = await sendCommandToExtension("click_element_by_selector", { selector: a.selector });
+                        if (eid) resultMsg = await bridge.sendCommand("click_element", { id: eid, text: a.value });
+                        else if (a.selector) resultMsg = await bridge.sendCommand("click_element_by_selector", { selector: a.selector });
                         else if (a.coordinate) {
                             const [x, y] = String(a.coordinate).split(',').map(Number);
-                            resultMsg = await sendCommandToExtension("click", { x, y });
+                            resultMsg = await bridge.sendCommand("click", { x, y });
                         } else {
-                             resultMsg = await sendCommandToExtension(action, a);
+                             resultMsg = await bridge.sendCommand(action, a);
                         }
                     } else if (action === "type") {
-                        if (eid || a.selector) await sendCommandToExtension(eid ? "click_element" : "click_element_by_selector", { id: eid, selector: a.selector });
-                        resultMsg = await sendCommandToExtension("type", { text: a.value || a.text });
+                        if (eid || a.selector) await bridge.sendCommand(eid ? "click_element" : "click_element_by_selector", { id: eid, selector: a.selector });
+                        resultMsg = await bridge.sendCommand("type", { text: a.value || a.text });
                     } else if (action === "navigate") {
-                        resultMsg = await sendCommandToExtension("navigate", { url: a.value });
+                        resultMsg = await bridge.sendCommand("navigate", { url: a.value });
                     } else {
-                        resultMsg = await sendCommandToExtension(action, a);
+                        resultMsg = await bridge.sendCommand(action, a);
                     }
                     node.status = 'success';
                 } catch (err: any) {
@@ -346,9 +438,72 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                 return { content: [{ type: "text", text: typeof resultMsg === 'string' ? resultMsg : JSON.stringify(resultMsg) }] };
             }
 
+            // ==================== AGENT-CENTRIC APIs ====================
+            if (name === "agent_action") {
+                const result = await bridge.sendCommand("agent_action", {
+                    action: a.action,
+                    target: a.target,
+                    verify: a.verify,
+                    waitFor: a.waitFor,
+                    timeout: a.timeout
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            }
+
+            if (name === "smart_navigate") {
+                const result = await bridge.sendCommand("smart_navigate", {
+                    url: a.url,
+                    waitFor: a.waitFor,
+                    dismissPopups: a.dismissPopups,
+                    screenshot: a.screenshot,
+                    timeout: a.timeout
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            }
+
+            if (name === "observe_and_act") {
+                const result = await bridge.sendCommand("observe_and_act", {
+                    action: a.action,
+                    observe: a.observe,
+                    returnScreenshot: a.returnScreenshot
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            }
+
+            if (name === "agent_form_fill") {
+                const result = await bridge.sendCommand("agent_form_fill", {
+                    fields: a.fields,
+                    submitAfterFill: a.submitAfterFill,
+                    submitSelector: a.submitSelector
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            }
+
+            if (name === "page_snapshot") {
+                const result = await bridge.sendCommand("page_snapshot", {
+                    fullPage: a.fullPage,
+                    includeDOMSnapshot: a.includeDOMSnapshot
+                });
+                
+                const content: any[] = [
+                    { type: "text", text: `Title: ${result.title}\nURL: ${result.url}` }
+                ];
+                if (result.screenshot) {
+                    content.push({ type: "image", data: result.screenshot, mimeType: "image/jpeg" });
+                }
+                if (result.elements) {
+                    content.push({ type: "text", text: `\nInteractive Elements: ${JSON.stringify(result.elements, null, 2)}` });
+                }
+                return { content };
+            }
+
             throw new Error(`Unknown tool: ${name}`);
         } catch (error: any) {
+            if (error.message?.includes("not connected") || error.message?.includes("No active extension")) {
+                return { content: [{ type: "text", text: `Browser not connected. Use 'connect_browser' tool first to connect or launch Chrome.` }], isError: true };
+            }
             return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
         }
     });
 }
+

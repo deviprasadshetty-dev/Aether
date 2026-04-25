@@ -1,8 +1,10 @@
 # ⚡ Aether — AI Browser Controller
 
-> **Let AI agents see and control your browser with native precision.**
+> **Let AI agents see and control your browser with native precision — no extension needed.**
 
-Aether is a high-performance MCP (Model Context Protocol) server + Chrome Extension that gives AI agents full browser control using the Chrome DevTools Protocol (CDP). It provides high-fidelity interactions — clicking, typing, scrolling, navigation — with a beautiful visual overlay that shows when the agent is in control.
+Aether is a high-performance MCP (Model Context Protocol) server that gives AI agents full browser control using the Chrome DevTools Protocol (CDP). It provides high-fidelity interactions — clicking, typing, scrolling, navigation — with a beautiful visual overlay that shows when the agent is in control.
+
+**New in v2.0:** Extension-less CDP mode with auto-detection for Chrome, Edge, Brave, and Firefox.
 
 ---
 
@@ -22,11 +24,36 @@ Aether is a high-performance MCP (Model Context Protocol) server + Chrome Extens
 | 🛡️ **Network Control** | Block ads, images, and trackers or mock specific API calls |
 | 📱 **Mobile Emulation** | Simulate iPhone/Android viewports and user agents |
 | 🧠 **Accessibility Tree** | Semantic page view for better agent understanding |
+| 🚀 **No Extension** | Direct CDP connection — no service worker issues |
+| 🌐 **Multi-Browser** | Auto-detects Chrome, Edge, Brave, Firefox |
 
 ---
 
 ## 🏗️ Architecture
 
+### CDP Mode (Default — No Extension)
+```
+┌─────────────────────┐
+│   AI Agent (MCP)    │
+│  (Claude, etc.)     │
+└─────────┬───────────┘
+          │ stdio (JSON-RPC)
+┌─────────▼───────────┐
+│   Aether MCP Server │
+│   (Node.js + TS)    │
+└─────────┬───────────┘
+          │ CDP (direct connection)
+┌─────────▼───────────┐
+│   Browser (Chrome,  │
+│   Edge, Brave, FF)  │
+│  ┌────────────────┐ │
+│  │ CDP Protocol   │ │
+│  │ DOM + Input    │ │
+│  └────────────────┘ │
+└─────────────────────┘
+```
+
+### Extension Mode (Legacy)
 ```
 ┌─────────────────────┐
 │   AI Agent (MCP)    │
@@ -61,14 +88,7 @@ npm install
 npm run build
 ```
 
-### 2. Load the Chrome Extension
-
-1. Open `chrome://extensions`
-2. Enable **Developer Mode**
-3. Click **Load Unpacked** → select the `extension/` folder
-4. You should see **"Aether — AI Browser Controller"** appear
-
-### 3. Configure Your MCP Client
+### 2. Configure Your MCP Client
 
 Add to your MCP client config (e.g. `claude_desktop_config.json`):
 
@@ -81,6 +101,28 @@ Add to your MCP client config (e.g. `claude_desktop_config.json`):
     }
   }
 }
+```
+
+### 3. Launch a Browser (No Manual Setup Needed!)
+
+Aether auto-detects and launches available browsers:
+
+```
+# In your AI agent, use these tools:
+list_browsers()                    # See available browsers
+launch_browser()                    # Auto-detect & launch
+launch_browser(browser="chrome")   # Specify browser
+launch_browser(browser="edge")      # Use Microsoft Edge
+launch_browser(browser="brave")    # Use Brave
+launch_browser(browser="firefox")   # Use Firefox
+kill_browser()                     # Kill when done
+```
+
+Or connect to an existing browser:
+```bash
+# Launch browser manually with remote debugging:
+chrome --remote-debugging-port=9222
+# Then let Aether connect automatically
 ```
 
 ---
@@ -97,6 +139,8 @@ While generic CDP MCP servers exist, they are often just raw protocol wrappers. 
 | 🗺️ **Task Memory** | **UFO3 Task Constellation** (hierarchical graphs) | Stateless actions |
 | 🤖 **Computer Use** | Native Anthropic `computer_20241022` implementation | Not supported |
 | 🕵️ **Stealth** | Automatic `navigator.webdriver` & detection bypass | Transparent bot signature |
+| 🚀 **No Extension** | Direct CDP — no service worker issues | Often requires setup |
+| 🌐 **Multi-Browser** | Auto-detects Chrome, Edge, Brave, Firefox | Usually Chrome-only |
 
 ---
 
