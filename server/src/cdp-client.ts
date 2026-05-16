@@ -5,6 +5,8 @@ import { promises as fs } from "fs";
 import path from "path";
 import os from "os";
 
+import { STEALTH_SCRIPT } from "./stealth";
+
 interface CdpTarget {
     id: string;
     webSocketDebuggerUrl: string;
@@ -19,6 +21,11 @@ interface PendingRequest {
     timeout: NodeJS.Timeout;
 }
 
+interface WaitForSelectorOptions {
+    visible?: boolean;
+    stable?: boolean;
+}
+
 export class CdpClient {
     private ws: WebSocket | null = null;
     private messageId = 0;
@@ -29,6 +36,14 @@ export class CdpClient {
     private eventListeners = new Map<string, ((params: any) => void)[]>();
     private connected = false;
     private reconnectTimer: NodeJS.Timeout | null = null;
+    private intentionalClose = false;
+    private networkTraffic: any[] = [];
+    private consoleLogs: any[] = [];
+    private readonly MAX_TRAFFIC_LOGS = 100;
+    private readonly MAX_CONSOLE_LOGS = 100;
+    private mousePosition: { x: number; y: number } | null = null;
+    private networkLoggingAttached = false;
+    private diagnosticsLoggingAttached = false;
 
     constructor() {}
 
@@ -90,6 +105,7 @@ export class CdpClient {
      */
     async attachToTarget(target: CdpTarget): Promise<void> {
         if (this.ws) {
+            this.intentionalClose = true;
             this.ws.close();
             this.ws = null;
         }
@@ -108,7 +124,19 @@ export class CdpClient {
                         this.sendCommand("Network.enable"),
                         this.sendCommand("Runtime.enable"),
                         this.sendCommand("DOM.enable"),
+                        this.sendCommand("Log.enable").catch(() => {}),
+                        this.sendCommand("Animation.enable").catch(() => {}),
+                        this.sendCommand("Page.addScriptToEvaluateOnNewDocument", {
+                            source: STEALTH_SCRIPT
+                        })
                     ]);
+
+                    // Keep animations running. Pausing them can freeze SPA loaders and leave pages looking blank.
+                    this.sendCommand("Animation.setPlaybackRate", { playbackRate: 1 }).catch(() => {});
+
+                    this.attachNetworkLogging();
+                    this.attachDiagnosticsLogging();
+
                     console.error("[CDP] Core CDP domains enabled");
                 } catch (e) {
                     console.error("[CDP] Failed to enable core domains:", e);
@@ -139,6 +167,10 @@ export class CdpClient {
             this.ws.on("close", () => {
                 this.connected = false;
                 console.error("[CDP] Connection closed");
+                if (this.intentionalClose) {
+                    this.intentionalClose = false;
+                    return;
+                }
                 this.scheduleReconnect();
             });
 
@@ -177,6 +209,19 @@ export class CdpClient {
         await this.sendCommand("Page.navigate", { url });
     }
 
+    async navigateAndWait(url: string, timeout: number = 10000): Promise<void> {
+        const navPromise = this.waitForNavigation(Math.min(timeout, 10000)).catch(() => undefined);
+        await this.navigate(url);
+        const completed = await Promise.race([
+            navPromise.then(() => true),
+            new Promise<boolean>((resolve) => setTimeout(() => resolve(false), Math.min(timeout, 1500))),
+        ]);
+
+        if (!completed) {
+            await this.waitForNetworkIdle(300, Math.min(timeout, 2500)).catch(() => {});
+        }
+    }
+
     /**
      * Take screenshot
      */
@@ -187,6 +232,428 @@ export class CdpClient {
             captureBeyondViewport: false,
         });
         return result.data; // base64 encoded
+    }
+
+    /**
+     * Get interactive elements with Set-of-Marks (SoM) overlay
+     * Returns element map with IDs and injects visual markers
+     */
+    async getInteractiveElements(withSoM: boolean = true): Promise<{
+        elements: Array<{
+            id: number;
+            tag: string;
+            text: string;
+            selector: string;
+            bounds: { x: number; y: number; width: number; height: number };
+            attributes: Record<string, string>;
+        }>;
+        somInjected: boolean;
+    }> {
+        const result = await this.sendCommand("Runtime.evaluate", {
+            expression: `
+                (function() {
+                    // Find interactive elements
+                    const selectors = [
+                        'a[href]', 'button', 'input:not([type="hidden"])', 'select', 'textarea',
+                        '[onclick]', '[role="button"]', '[role="link"]', '[role="checkbox"]',
+                        '[tabindex]:not([tabindex="-1"])', 'label', 'summary'
+                    ].join(', ');
+                    
+                    const elements = Array.from(document.querySelectorAll(selectors));
+                    const rect = document.documentElement.getBoundingClientRect();
+                    
+                    const items = elements.map((el, idx) => {
+                        const r = el.getBoundingClientRect();
+                        const computed = window.getComputedStyle(el);
+                        if (computed.display === 'none' || computed.visibility === 'hidden' || r.width === 0 || r.height === 0) {
+                            return null;
+                        }
+                        
+                        // Get text content
+                        let text = el.innerText || el.textContent || '';
+                        text = text.trim().substring(0, 100);
+                        
+                        // Get selector
+                        let selector = '';
+                        if (el.id) selector = '#' + el.id;
+                        else if (el.className && typeof el.className === 'string') selector = '.' + el.className.split(' ')[0];
+                        else selector = el.tagName.toLowerCase();
+                        
+                        return {
+                            id: idx + 1,
+                            tag: el.tagName.toLowerCase(),
+                            text: text,
+                            selector: selector,
+                            bounds: { 
+                                x: Math.max(0, r.left - rect.left), 
+                                y: Math.max(0, r.top - rect.top), 
+                                width: r.width, 
+                                height: r.height 
+                            },
+                            attributes: {
+                                type: el.getAttribute('type') || '',
+                                href: el.getAttribute('href') || '',
+                                role: el.getAttribute('role') || '',
+                                'aria-label': el.getAttribute('aria-label') || ''
+                            }
+                        };
+                    }).filter(x => x !== null);
+                    
+                    return items;
+                })()
+            `,
+            returnByValue: true,
+            awaitPromise: true,
+        });
+
+        const elements = result.result?.value || [];
+
+        let somInjected = false;
+        
+        if (withSoM && elements.length > 0) {
+            // Inject SoM overlay
+            await this.sendCommand("Runtime.evaluate", {
+                expression: `
+                    (function() {
+                        // Remove existing overlays
+                        document.querySelectorAll('.aether-som-marker').forEach(el => el.remove());
+                        
+                        const elements = ${JSON.stringify(elements)};
+                        
+                        elements.forEach(el => {
+                            const id = String(el.id);
+                            const w = Math.max(20, id.length * 8 + 14);
+                            const marker = document.createElement('div');
+                            marker.className = 'aether-som-marker';
+                            marker.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="20" style="display:block">'
+                                + '<rect width="' + w + '" height="20" rx="10" fill="#1e40af"/>'
+                                + '<text x="' + (w / 2) + '" y="10" dominant-baseline="central" text-anchor="middle" font-family="ui-monospace,monospace" font-size="11" font-weight="700" fill="white">' + id + '</text>'
+                                + '</svg>';
+                            marker.style.cssText = \`
+                                position: absolute;
+                                left: \${el.bounds.x}px;
+                                top: \${el.bounds.y}px;
+                                z-index: 2147483647;
+                                pointer-events: none;
+                                filter: drop-shadow(0 1px 4px rgba(0,0,0,0.35));
+                                transform: translate(-4px, -4px);
+                            \`;
+                            document.body.appendChild(marker);
+                        });
+                        
+                        return true;
+                    })()
+                `,
+                returnByValue: true,
+            });
+            somInjected = true;
+        }
+
+        return { elements, somInjected };
+    }
+
+    /**
+     * Remove Set-of-Marks overlay
+     */
+    async removeSoMOverlay(): Promise<void> {
+        await this.sendCommand("Runtime.evaluate", {
+            expression: `
+                document.querySelectorAll('.aether-som-marker').forEach(el => el.remove());
+            `,
+        });
+    }
+
+    /**
+     * Wait for a selector to appear in DOM
+     */
+    async waitForSelector(selector: string, timeout: number = 10000, options: WaitForSelectorOptions = {}): Promise<boolean> {
+        const startTime = Date.now();
+        let lastBox: any = null;
+        let stableSince = 0;
+        
+        while (Date.now() - startTime < timeout) {
+            const result = await this.sendCommand("Runtime.evaluate", {
+                expression: `
+                    (function() {
+                        const el = document.querySelector(${JSON.stringify(selector)});
+                        if (!el) return { found: false };
+                        const rect = el.getBoundingClientRect();
+                        const computed = window.getComputedStyle(el);
+                        const visible = computed.display !== 'none' &&
+                            computed.visibility !== 'hidden' &&
+                            computed.opacity !== '0' &&
+                            rect.width > 0 &&
+                            rect.height > 0;
+                        return {
+                            found: true,
+                            visible,
+                            box: {
+                                x: Math.round(rect.left),
+                                y: Math.round(rect.top),
+                                width: Math.round(rect.width),
+                                height: Math.round(rect.height)
+                            }
+                        };
+                    })()
+                `,
+                returnByValue: true,
+            });
+            
+            const state = result.result?.value;
+            if (state?.found && (!options.visible || state.visible)) {
+                if (!options.stable) return true;
+
+                const box = state.box;
+                const sameBox = lastBox &&
+                    lastBox.x === box.x &&
+                    lastBox.y === box.y &&
+                    lastBox.width === box.width &&
+                    lastBox.height === box.height;
+                if (sameBox) {
+                    if (!stableSince) stableSince = Date.now();
+                    if (Date.now() - stableSince >= 120) return true;
+                } else {
+                    stableSince = 0;
+                    lastBox = box;
+                }
+            }
+            
+            await new Promise(r => setTimeout(r, 75));
+        }
+        
+        return false;
+    }
+
+    /**
+     * Wait for navigation to complete
+     */
+    async waitForNavigation(timeout: number = 10000): Promise<void> {
+        await this.sendCommand("Page.enable", {});
+        
+        return new Promise((resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+                this.removeEventListener("Page.loadEventFired", listener);
+                reject(new Error("Navigation timeout"));
+            }, timeout);
+            
+            const listener = () => {
+                clearTimeout(timeoutId);
+                this.removeEventListener("Page.loadEventFired", listener);
+                resolve();
+            };
+            
+            this.on("Page.loadEventFired", listener);
+        });
+    }
+
+    /**
+     * Wait for network idle (no requests for specified duration)
+     */
+    async waitForNetworkIdle(idleTimeout: number = 500, timeout: number = 10000): Promise<void> {
+        await this.sendCommand("Network.enable", {});
+        
+        return new Promise((resolve, reject) => {
+            let lastRequestTime = Date.now();
+            let idleCheckInterval: NodeJS.Timeout;
+            let timeoutId: NodeJS.Timeout;
+            
+            const resetIdle = () => {
+                lastRequestTime = Date.now();
+            };
+            
+            const checkIdle = () => {
+                if (Date.now() - lastRequestTime >= idleTimeout) {
+                    clearInterval(idleCheckInterval);
+                    clearTimeout(timeoutId);
+                    this.removeEventListener("Network.requestWillBeSent", resetIdle);
+                    this.removeEventListener("Network.responseReceived", resetIdle);
+                    resolve();
+                }
+            };
+            
+            timeoutId = setTimeout(() => {
+                clearInterval(idleCheckInterval);
+                this.removeEventListener("Network.requestWillBeSent", resetIdle);
+                this.removeEventListener("Network.responseReceived", resetIdle);
+                resolve(); // Resolve anyway after timeout
+            }, timeout);
+            
+            idleCheckInterval = setInterval(checkIdle, 100);
+            
+            this.on("Network.requestWillBeSent", resetIdle);
+            this.on("Network.responseReceived", resetIdle);
+        });
+    }
+
+    private attachNetworkLogging(): void {
+        if (this.networkLoggingAttached) return;
+        this.networkLoggingAttached = true;
+
+        this.on("Network.requestWillBeSent", (params) => {
+            this.networkTraffic.push({
+                type: "request",
+                requestId: params.requestId,
+                url: params.request.url,
+                method: params.request.method,
+                timestamp: new Date().toISOString(),
+            });
+            if (this.networkTraffic.length > this.MAX_TRAFFIC_LOGS) this.networkTraffic.shift();
+        });
+
+        this.on("Network.responseReceived", (params) => {
+            this.networkTraffic.push({
+                type: "response",
+                requestId: params.requestId,
+                url: params.response.url,
+                status: params.response.status,
+                mimeType: params.response.mimeType,
+                timestamp: new Date().toISOString(),
+            });
+            if (this.networkTraffic.length > this.MAX_TRAFFIC_LOGS) this.networkTraffic.shift();
+        });
+
+        this.on("Network.loadingFailed", (params) => {
+            this.networkTraffic.push({
+                type: "error",
+                requestId: params.requestId,
+                errorText: params.errorText,
+                timestamp: new Date().toISOString(),
+            });
+            if (this.networkTraffic.length > this.MAX_TRAFFIC_LOGS) this.networkTraffic.shift();
+        });
+    }
+
+    private attachDiagnosticsLogging(): void {
+        if (this.diagnosticsLoggingAttached) return;
+        this.diagnosticsLoggingAttached = true;
+
+        const pushLog = (entry: any) => {
+            this.consoleLogs.push({ timestamp: new Date().toISOString(), ...entry });
+            if (this.consoleLogs.length > this.MAX_CONSOLE_LOGS) this.consoleLogs.shift();
+        };
+
+        this.on("Runtime.consoleAPICalled", (params) => {
+            pushLog({
+                source: "console",
+                level: params.type,
+                text: (params.args || []).map((arg: any) => arg.value ?? arg.description ?? arg.type).join(" "),
+                url: params.stackTrace?.callFrames?.[0]?.url,
+                lineNumber: params.stackTrace?.callFrames?.[0]?.lineNumber,
+            });
+        });
+
+        this.on("Runtime.exceptionThrown", (params) => {
+            pushLog({
+                source: "exception",
+                level: "error",
+                text: params.exceptionDetails?.text || params.exceptionDetails?.exception?.description || "Runtime exception",
+                url: params.exceptionDetails?.url,
+                lineNumber: params.exceptionDetails?.lineNumber,
+            });
+        });
+
+        this.on("Log.entryAdded", (params) => {
+            const entry = params.entry || {};
+            pushLog({
+                source: entry.source || "log",
+                level: entry.level,
+                text: entry.text,
+                url: entry.url,
+                lineNumber: entry.lineNumber,
+            });
+        });
+
+        this.on("Page.javascriptDialogOpening", (params) => {
+            pushLog({
+                source: "dialog",
+                level: "warning",
+                text: `${params.type}: ${params.message}`,
+                url: params.url,
+            });
+        });
+    }
+
+    removeEventListener(event: string, listener: (params: any) => void): void {
+        const listeners = this.eventListeners.get(event) || [];
+        const idx = listeners.indexOf(listener);
+        if (idx !== -1) {
+            listeners.splice(idx, 1);
+        }
+    }
+
+    async getTabs(): Promise<CdpTarget[]> {
+        return await this.listTargets();
+    }
+
+    async switchToTarget(targetId: string, port: number = 9222): Promise<void> {
+        const targets = await this.listTargets(port);
+        const target = targets.find(t => t.id === targetId);
+        if (!target) {
+            throw new Error(`Target not found: ${targetId}`);
+        }
+        await this.attachToTarget(target);
+    }
+
+    /**
+     * Get a simplified version of the Accessibility Tree for AI agents.
+     */
+    async getSimplifiedAccessibilityTree(): Promise<any[]> {
+        await this.sendCommand("Accessibility.enable");
+        const result = await this.sendCommand("Accessibility.getFullAXTree");
+        
+        if (!result || !result.nodes) return [];
+
+        const nodes = result.nodes;
+        const interactiveNodes: any[] = [];
+        
+        // Map of node IDs for fast lookup
+        const nodeMap = new Map();
+        nodes.forEach((node: any) => nodeMap.set(node.nodeId, node));
+
+        // Helper to get name from node properties
+        const getNodeName = (node: any) => {
+            if (node.name?.value) return node.name.value;
+            const nameProp = node.properties?.find((p: any) => p.name === "name");
+            return nameProp?.value?.value || "";
+        };
+
+        // Filter and simplify nodes
+        nodes.forEach((node: any) => {
+            const role = node.role?.value;
+            const name = getNodeName(node);
+            
+            // Only include interactive or meaningful nodes
+            const isInteractive = [
+                "button", "link", "checkbox", "radio", "textbox", "searchbox", 
+                "combobox", "listbox", "menuitem", "slider", "switch", "tab"
+            ].includes(role);
+
+            const hasAction = node.properties?.some((p: any) => 
+                ["pressed", "expanded", "selected", "focused"].includes(p.name)
+            );
+
+            if (isInteractive || (name && name.length > 0 && role !== "generic" && role !== "none")) {
+                interactiveNodes.push({
+                    id: node.nodeId,
+                    role: role,
+                    name: name,
+                    description: node.description?.value || "",
+                    value: node.value?.value || "",
+                    disabled: node.properties?.find((p: any) => p.name === "disabled")?.value?.value || false,
+                    focused: node.properties?.find((p: any) => p.name === "focused")?.value?.value || false,
+                });
+            }
+        });
+
+        return interactiveNodes;
+    }
+
+    async getNetworkTraffic(): Promise<any[]> {
+        return this.networkTraffic;
+    }
+
+    async getConsoleLogs(limit: number = 50): Promise<any[]> {
+        return this.consoleLogs.slice(-limit);
     }
 
     /**
@@ -208,8 +675,8 @@ export class CdpClient {
             returnByValue: true,
             awaitPromise: true,
         });
-    return result.result;
-}
+        return result.result?.value !== undefined ? result.result.value : result.result;
+    }
 
 // ==================== Runtime Methods ====================
 async callFunctionOn(functionDeclaration: string, objectId?: string, returnByValue: boolean = true, awaitPromise: boolean = false): Promise<any> {
@@ -627,30 +1094,312 @@ async takeHeapSnapshot(reportProgress?: boolean, treatGlobalObjectsAsRoots?: boo
 }
 
 /**
- * Click at coordinates
+ * Click at coordinates with human-like timing and micro-jitter.
  */
 async click(x: number, y: number, button: "left" | "middle" | "right" = "left"): Promise<void> {
+        const targetX = Math.round(Number(x));
+        const targetY = Math.round(Number(y));
+        await this.moveMouse(targetX, targetY);
+
+        // Pre-click hover pause — humans don't instantly press after arriving
+        await new Promise((r) => setTimeout(r, 80 + Math.random() * 140));
+
+        // Micro-jitter at the moment of click (hand tremor)
+        const cx = targetX + Math.round((Math.random() - 0.5) * 3);
+        const cy = targetY + Math.round((Math.random() - 0.5) * 3);
+
         await this.sendCommand("Input.dispatchMouseEvent", {
-            type: "mousePressed",
-            x,
-            y,
-            button,
-            clickCount: 1,
+            type: "mousePressed", x: cx, y: cy, button, clickCount: 1, pointerType: "mouse",
         });
+        // Natural hold duration before release
+        await new Promise((r) => setTimeout(r, 60 + Math.random() * 110));
         await this.sendCommand("Input.dispatchMouseEvent", {
-            type: "mouseReleased",
-            x,
-            y,
-            button,
-            clickCount: 1,
+            type: "mouseReleased", x: cx, y: cy, button, clickCount: 1, pointerType: "mouse",
         });
     }
 
     /**
-     * Type text using Input.insertText (more reliable than individual key events)
+     * Move mouse along a cubic Bezier arc — human-like curve, variable speed, micro-jitter.
+     */
+    async moveMouse(x: number, y: number): Promise<void> {
+        const targetX = Math.round(Number(x));
+        const targetY = Math.round(Number(y));
+        const start = this.mousePosition ?? { x: targetX, y: targetY };
+
+        const dist = Math.hypot(targetX - start.x, targetY - start.y);
+        if (dist < 2) {
+            this.mousePosition = { x: targetX, y: targetY };
+            return;
+        }
+
+        // ~1 step per 5px, clamped 15-55 steps
+        const steps = Math.max(15, Math.min(55, Math.round(dist / 5)));
+
+        // Random cubic Bezier control points — creates an organic arc
+        const angle  = Math.atan2(targetY - start.y, targetX - start.x) + Math.PI / 2;
+        const spread = dist * (0.25 + Math.random() * 0.35);
+        const sign   = Math.random() < 0.5 ? 1 : -1;
+
+        const cp1 = {
+            x: start.x + (targetX - start.x) * (0.1 + Math.random() * 0.2) + Math.cos(angle) * spread * sign * (0.3 + Math.random() * 0.7),
+            y: start.y + (targetY - start.y) * (0.1 + Math.random() * 0.2) + Math.sin(angle) * spread * sign * (0.3 + Math.random() * 0.7),
+        };
+        const cp2 = {
+            x: start.x + (targetX - start.x) * (0.7 + Math.random() * 0.2) + Math.cos(angle) * spread * sign * (0.05 + Math.random() * 0.35),
+            y: start.y + (targetY - start.y) * (0.7 + Math.random() * 0.2) + Math.sin(angle) * spread * sign * (0.05 + Math.random() * 0.35),
+        };
+
+        await this.updateMouseOverlay(start.x, start.y).catch(() => {});
+
+        for (let i = 1; i <= steps; i++) {
+            const t = i / steps;
+            // Ease-in-out: slow start, fast middle, slow near target
+            const e = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+            const u = 1 - e;
+            const px = u*u*u*start.x + 3*u*u*e*cp1.x + 3*u*e*e*cp2.x + e*e*e*targetX;
+            const py = u*u*u*start.y + 3*u*u*e*cp1.y + 3*u*e*e*cp2.y + e*e*e*targetY;
+
+            // Per-step micro-jitter simulates hand tremor
+            const cx = Math.round(px + (Math.random() - 0.5) * 1.2);
+            const cy = Math.round(py + (Math.random() - 0.5) * 1.2);
+
+            await this.sendCommand("Input.dispatchMouseEvent", {
+                type: "mouseMoved", x: cx, y: cy, button: "none", pointerType: "mouse",
+            });
+            await this.updateMouseOverlay(cx, cy).catch(() => {});
+
+            // Variable step delay: faster mid-arc, slower as approaching target
+            const nearEnd = i > steps * 0.82;
+            await new Promise((r) => setTimeout(r, nearEnd ? 8 + Math.random() * 16 : 2 + Math.random() * 6));
+        }
+
+        this.mousePosition = { x: targetX, y: targetY };
+    }
+
+    getMousePosition(): { x: number; y: number } {
+        return this.mousePosition ?? { x: 300, y: 300 };
+    }
+
+    private async updateMouseOverlay(x: number, y: number): Promise<void> {
+        await this.sendCommand("Runtime.evaluate", {
+            expression: `
+                (function() {
+                    const x = ${JSON.stringify(Math.round(x))};
+                    const y = ${JSON.stringify(Math.round(y))};
+                    let cursor = document.getElementById('__aether_mouse_cursor');
+                    if (!cursor) {
+                        cursor = document.createElement('div');
+                        cursor.id = '__aether_mouse_cursor';
+                        cursor.setAttribute('aria-hidden', 'true');
+                        cursor.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" style="display:block"><path d="M20.5056 10.7754C21.1225 10.5355 21.431 10.4155 21.5176 10.2459C21.5926 10.099 21.5903 9.92446 21.5115 9.77954C21.4205 9.61226 21.109 9.50044 20.486 9.2768L4.59629 3.5728C4.0866 3.38983 3.83175 3.29835 3.66514 3.35605C3.52029 3.40621 3.40645 3.52004 3.35629 3.6649C3.29859 3.8315 3.39008 4.08635 3.57304 4.59605L9.277 20.4858C9.50064 21.1088 9.61246 21.4203 9.77973 21.5113C9.92465 21.5901 10.0991 21.5924 10.2461 21.5174C10.4157 21.4308 10.5356 21.1223 10.7756 20.5054L13.3724 13.8278C13.4194 13.707 13.4429 13.6466 13.4792 13.5957C13.5114 13.5506 13.5508 13.5112 13.5959 13.479C13.6468 13.4427 13.7072 13.4192 13.828 13.3722L20.5056 10.7754Z" stroke="#111111" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5056 10.7754C21.1225 10.5355 21.431 10.4155 21.5176 10.2459C21.5926 10.099 21.5903 9.92446 21.5115 9.77954C21.4205 9.61226 21.109 9.50044 20.486 9.2768L4.59629 3.5728C4.0866 3.38983 3.83175 3.29835 3.66514 3.35605C3.52029 3.40621 3.40645 3.52004 3.35629 3.6649C3.29859 3.8315 3.39008 4.08635 3.57304 4.59605L9.277 20.4858C9.50064 21.1088 9.61246 21.4203 9.77973 21.5113C9.92465 21.5901 10.0991 21.5924 10.2461 21.5174C10.4157 21.4308 10.5356 21.1223 10.7756 20.5054L13.3724 13.8278C13.4194 13.707 13.4429 13.6466 13.4792 13.5957C13.5114 13.5506 13.5508 13.5112 13.5959 13.479C13.6468 13.4427 13.7072 13.4192 13.828 13.3722L20.5056 10.7754Z" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+                        cursor.style.cssText = [
+                            'position: fixed',
+                            'left: 0',
+                            'top: 0',
+                            'transform: translate(-3px, -3px)',
+                            'transition: left 70ms linear, top 70ms linear, opacity 120ms ease',
+                            'z-index: 2147483647',
+                            'pointer-events: none',
+                            'opacity: 1'
+                        ].join(';');
+                        document.documentElement.appendChild(cursor);
+                    }
+                    cursor.style.left = x + 'px';
+                    cursor.style.top = y + 'px';
+                    cursor.style.opacity = '1';
+                    clearTimeout(window.__aetherMouseCursorTimer);
+                    window.__aetherMouseCursorTimer = setTimeout(() => {
+                        const current = document.getElementById('__aether_mouse_cursor');
+                        if (current) current.style.opacity = '0.55';
+                    }, 900);
+                    return true;
+                })()
+            `,
+            returnByValue: true,
+        });
+    }
+
+    private async showScrollIndicator(x: number, y: number, deltaY: number): Promise<void> {
+        const isDown = deltaY > 0;
+        const chevron = (dy: number, opacity: number) => {
+            const d = isDown
+                ? `M10,${dy} L16,${dy + 7} L22,${dy}`
+                : `M10,${dy + 7} L16,${dy} L22,${dy + 7}`;
+            return `<path d="${d}" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="${opacity}"/>`;
+        };
+        const chevrons = isDown
+            ? chevron(4, 0.3) + chevron(15, 0.65) + chevron(26, 1)
+            : chevron(26, 0.3) + chevron(15, 0.65) + chevron(4, 1);
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="36" style="display:block">${chevrons}</svg>`;
+
+        await this.sendCommand("Runtime.evaluate", {
+            expression: `
+                (function() {
+                    var ind = document.getElementById('__aether_scroll_ind');
+                    if (ind) ind.remove();
+                    ind = document.createElement('div');
+                    ind.id = '__aether_scroll_ind';
+                    ind.innerHTML = ${JSON.stringify(svg)};
+                    ind.style.cssText = [
+                        'position: fixed',
+                        'left: ${Math.round(x)}px',
+                        'top: ${Math.round(y)}px',
+                        'transform: translate(-50%, -50%)',
+                        'background: rgba(0,0,0,0.52)',
+                        'border-radius: 20px',
+                        'padding: 6px 8px',
+                        'z-index: 2147483647',
+                        'pointer-events: none',
+                        'opacity: 1',
+                        'transition: opacity 300ms ease'
+                    ].join(';');
+                    document.documentElement.appendChild(ind);
+                    clearTimeout(window.__aetherScrollTimer);
+                    window.__aetherScrollTimer = setTimeout(function() {
+                        var cur = document.getElementById('__aether_scroll_ind');
+                        if (cur) {
+                            cur.style.opacity = '0';
+                            setTimeout(function() { if (cur.parentNode) cur.parentNode.removeChild(cur); }, 320);
+                        }
+                    }, 500);
+                    return true;
+                })()
+            `,
+            returnByValue: true,
+        }).catch(() => {});
+    }
+
+    async moveMouseToSelector(selector: string): Promise<boolean> {
+        const result = await this.evaluate(`
+            (function() {
+                const el = document.querySelector(${JSON.stringify(selector)});
+                if (!el) return null;
+                el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return null;
+                return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+            })()
+        `);
+        if (!result) return false;
+        await this.moveMouse(result.x, result.y);
+        return true;
+    }
+
+    /**
+     * Scroll from the current or supplied pointer location using wheel events.
+     */
+    async wheel(deltaX: number, deltaY: number, x?: number, y?: number): Promise<void> {
+        const origin = {
+            x: Number(x ?? this.mousePosition?.x ?? 0),
+            y: Number(y ?? this.mousePosition?.y ?? 0),
+        };
+        await this.moveMouse(origin.x, origin.y);
+        const dominant = Math.abs(Number(deltaY)) >= Math.abs(Number(deltaX)) ? Number(deltaY) : Number(deltaX);
+        if (dominant !== 0) await this.showScrollIndicator(origin.x, origin.y, dominant);
+
+        // Break scroll into irregular chunks — humans don't scroll at perfectly uniform speed
+        const totalY = Number(deltaY);
+        const totalX = Number(deltaX);
+        const totalAbs = Math.max(Math.abs(totalX), Math.abs(totalY));
+        const steps = Math.max(1, Math.ceil(totalAbs / (300 + Math.random() * 400)));
+
+        let sentY = 0;
+        let sentX = 0;
+        for (let step = 0; step < steps; step++) {
+            const last = step === steps - 1;
+            // Random chunk size with slight ease-in (start slow, then momentum)
+            const fraction = last ? 1 : (0.5 + Math.random() * 0.5) / (steps - step);
+            const chunkY = last ? totalY - sentY : Math.round(totalY * fraction);
+            const chunkX = last ? totalX - sentX : Math.round(totalX * fraction);
+            sentY += chunkY;
+            sentX += chunkX;
+
+            await this.sendCommand("Input.dispatchMouseWheel", {
+                x: origin.x, y: origin.y, deltaX: chunkX, deltaY: chunkY,
+            });
+
+            if (!last) {
+                await new Promise((r) => setTimeout(r, 40 + Math.random() * 80));
+            }
+        }
+    }
+
+    /**
+     * Type text character-by-character with human-like WPM variance and thinking pauses.
      */
     async typeText(text: string): Promise<void> {
-        await this.sendCommand("Input.insertText", { text });
+        for (let i = 0; i < text.length; i++) {
+            const ch = text[i];
+            await this.sendCommand("Input.insertText", { text: ch });
+
+            // Base inter-key delay (~55-90 WPM range)
+            let delay = 35 + Math.random() * 75;
+
+            // Longer pause after spaces (word boundary) and punctuation
+            if (ch === " ")               delay += 15 + Math.random() * 55;
+            if (/[.,!?;:\n]/.test(ch))    delay += 60 + Math.random() * 110;
+
+            // ~3% chance of a "thinking" pause mid-sentence
+            if (Math.random() < 0.03)     delay += 250 + Math.random() * 600;
+
+            await new Promise((r) => setTimeout(r, delay));
+        }
+    }
+
+    async pressKey(key: string, modifiers: string[] = []): Promise<void> {
+        const modifierMask = this.modifierMask(modifiers);
+        const keyDef = this.keyDefinition(key);
+        await this.sendCommand("Input.dispatchKeyEvent", {
+            type: "keyDown",
+            key: keyDef.key,
+            code: keyDef.code,
+            windowsVirtualKeyCode: keyDef.windowsVirtualKeyCode,
+            nativeVirtualKeyCode: keyDef.windowsVirtualKeyCode,
+            modifiers: modifierMask,
+        });
+        await this.sendCommand("Input.dispatchKeyEvent", {
+            type: "keyUp",
+            key: keyDef.key,
+            code: keyDef.code,
+            windowsVirtualKeyCode: keyDef.windowsVirtualKeyCode,
+            nativeVirtualKeyCode: keyDef.windowsVirtualKeyCode,
+            modifiers: modifierMask,
+        });
+    }
+
+    private modifierMask(modifiers: string[]): number {
+        return modifiers.reduce((mask, modifier) => {
+            const key = modifier.toLowerCase();
+            if (key === "alt") return mask | 1;
+            if (key === "ctrl" || key === "control") return mask | 2;
+            if (key === "meta" || key === "cmd" || key === "command") return mask | 4;
+            if (key === "shift") return mask | 8;
+            return mask;
+        }, 0);
+    }
+
+    private keyDefinition(key: string): { key: string; code: string; windowsVirtualKeyCode: number } {
+        const normalized = key.length === 1 ? key : key.toLowerCase();
+        const special: Record<string, { key: string; code: string; windowsVirtualKeyCode: number }> = {
+            enter: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 },
+            tab: { key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 },
+            escape: { key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 },
+            esc: { key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 },
+            backspace: { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 },
+            delete: { key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 },
+            arrowup: { key: "ArrowUp", code: "ArrowUp", windowsVirtualKeyCode: 38 },
+            arrowdown: { key: "ArrowDown", code: "ArrowDown", windowsVirtualKeyCode: 40 },
+            arrowleft: { key: "ArrowLeft", code: "ArrowLeft", windowsVirtualKeyCode: 37 },
+            arrowright: { key: "ArrowRight", code: "ArrowRight", windowsVirtualKeyCode: 39 },
+            home: { key: "Home", code: "Home", windowsVirtualKeyCode: 36 },
+            end: { key: "End", code: "End", windowsVirtualKeyCode: 35 },
+            pageup: { key: "PageUp", code: "PageUp", windowsVirtualKeyCode: 33 },
+            pagedown: { key: "PageDown", code: "PageDown", windowsVirtualKeyCode: 34 },
+        };
+        if (special[normalized]) return special[normalized];
+        const upper = key.toUpperCase();
+        const code = /^[A-Z]$/.test(upper) ? `Key${upper}` : /^[0-9]$/.test(key) ? `Digit${key}` : key;
+        return { key, code, windowsVirtualKeyCode: upper.charCodeAt(0) };
     }
 
     /**
@@ -856,6 +1605,8 @@ async click(x: number, y: number, button: "left" | "middle" | "right" = "left"):
             args.push(
                 `--remote-debugging-port=${port}`,
                 `--user-data-dir=${userDataDir}`,
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
                 ...(headless ? ["--headless", "--disable-gpu"] : []),
                 ...(options?.extraArgs || []),
                 "about:blank"
@@ -925,6 +1676,7 @@ async click(x: number, y: number, button: "left" | "middle" | "right" = "left"):
             this.reconnectTimer = null;
         }
         if (this.ws) {
+            this.intentionalClose = true;
             this.ws.close();
             this.ws = null;
         }

@@ -26,7 +26,7 @@ const Tools = [
     },
     {
         name: "act",
-        description: "Perform precise, high-speed actions in the browser. Supports navigation, clicking, typing, scrolling, and tab management with atomic verification.",
+        description: "PRIMARY ACTION TOOL. Perform precise, high-speed actions in the browser. Uses native events which correctly trigger React/SPA state (unlike raw JS `value=` assignments). Supports navigation, clicking, typing, scrolling, and tab management with atomic verification.",
         inputSchema: {
             type: "object",
             properties: {
@@ -35,25 +35,35 @@ const Tools = [
                     enum: [
                         "navigate", "click", "type", "fill", "select", "check",
                         "hover", "scroll", "wait", "screenshot",
-                        "new_tab", "switch_tab", "close_tab", "drag_and_drop", "upload_file", "get_logs",
+                        "new_tab", "switch_tab", "close_tab", "drag_and_drop", "upload_file",
                         "get_tree", "get_dom_tree", "configure", "print_pdf", "emulate_network",
                         "get_cookies", "set_cookie", "clear_cache", "set_geolocation", "set_timezone", "get_performance_metrics",
-                        "start_screencast", "stop_screencast", "record_session",
-                        "mock_network_request", "generate_artifact", "highlight_elements",
-                        "assert", "start_tracing", "stop_tracing", "target_auto_attach", "enable_domain", "pause", "resume",
+                        "start_screencast", "stop_screencast", "record_session", "sample_visual_frames",
+                        "mock_network_request", "highlight_elements",
+                        "assert", "start_tracing", "stop_tracing",
                         "screenshot_region", "verify_ui_state", "get_dom_snapshot", "get_event_listeners",
                         "get_computed_style", "get_network_traffic", "get_network_response",
-                        "get_screencast_frames", "get_dom_storage"
+                        "get_screencast_frames", "get_dom_storage", "get_logs", "press_key", "key_combo",
+                        "click_text", "click_role", "fill_label", "element_at_point", "detect_captcha"
                     ],
                     description: "The action to perform."
                 },
                 selector: { type: "string", description: "CSS selector or text content to interact with." },
-                elementId: { type: "string", description: "Element ID from `get_state` (e.g., '@1' or '1'). Preferred over selector." },
+                text: { type: "string", description: "Text to click, type, or match." },
+                key: { type: "string", description: "Keyboard key for press_key/key_combo." },
+                role: { type: "string", description: "ARIA/native role hint for semantic actions." },
+                name: { type: "string", description: "Accessible name for click_role." },
+                label: { type: "string", description: "Visible or accessible label for fill_label." },
+                elementId: { type: "string", description: "Element ID from `get_state` (e.g., '1' or '@1'). Preferred over selector. Both formats are accepted." },
                 value: { type: "string", description: "Value to type, option to select, or URL to navigate to." },
                 assertionType: { type: "string", description: "Assertion type for 'assert' action (e.g., 'element_exists', 'element_not_exists', 'element_contains_text', 'url_contains')." },
                 options: { type: "object", description: "Options for the action (e.g., {x, y, width, height} for screenshot_region)." },
                 domain: { type: "string", description: "CDP domain to enable (for enable_domain action)." },
                 coordinate: { type: "string", description: "X,Y coordinates (e.g., '100,200')." },
+                x: { type: "number", description: "X coordinate." },
+                y: { type: "number", description: "Y coordinate." },
+                visible: { type: "boolean", description: "Require visible selector when waiting. Default varies by action." },
+                stable: { type: "boolean", description: "Require stable element bounds when waiting. Default varies by action." },
                 parentId: { type: "string", description: "Parent task ID for hierarchical tracking (UFO3)." },
                 tabId: { type: "number", description: "Tab ID for switching/closing." },
                 files: { type: "array", items: { type: "string" }, description: "Files for upload_file action" },
@@ -110,12 +120,235 @@ const Tools = [
     },
     {
         name: "get_state",
-        description: "Capture the current browser state (v2) — includes high-fidelity element map, screenshot, and console logs.",
-        inputSchema: { type: "object", properties: {} },
+        description: "Capture the current browser state (v2). Lightweight by default; opt into screenshots, DOM snapshot, SoM overlay, or tabs when needed.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                screenshot: { type: "boolean", description: "Include screenshot. Default false." },
+                domSnapshot: { type: "boolean", description: "Include full DOMSnapshot. Default false." },
+                elements: { type: "boolean", description: "Include interactive elements. Default true." },
+                som: { type: "boolean", description: "Inject Set-of-Marks overlay. Default false." },
+                tabs: { type: "boolean", description: "Include browser tabs. Default false." }
+            }
+        },
+    },
+    {
+        name: "browser_status",
+        description: "FAST IDE TOOL. Return compact browser connection and active target status without launching a browser.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                includeTargets: { type: "boolean", description: "Include known CDP targets/tabs when already connected." }
+            }
+        }
+    },
+    {
+        name: "snapshot_compact",
+        description: "FAST IDE TOOL. Capture a small text-only page snapshot: title, URL, readyState, and a limited interactive element list. No screenshot or DOM snapshot by default.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                maxElements: { type: "number", description: "Maximum interactive elements to return. Default 30." },
+                includeText: { type: "boolean", description: "Include short visible text for elements. Default true." }
+            }
+        }
+    },
+    {
+        name: "list_interactive_elements",
+        description: "FAST IDE TOOL. Return compact clickable/typable element references that can be passed to click_by_ref. Does not inject visual overlays unless requested.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                maxElements: { type: "number", description: "Maximum elements to return. Default 50." },
+                withOverlay: { type: "boolean", description: "Inject Set-of-Marks overlay. Default false." }
+            }
+        }
+    },
+    {
+        name: "click_by_ref",
+        description: "FAST IDE TOOL. Click an element reference returned by snapshot_compact or list_interactive_elements.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                ref: { type: "string", description: "Element reference, usually css:<selector>." }
+            },
+            required: ["ref"]
+        }
+    },
+    {
+        name: "click_by_selector",
+        description: "FAST IDE TOOL. Click a CSS selector with a compact response.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                selector: { type: "string" },
+                timeout: { type: "number", description: "Timeout in ms. Default 5000." }
+            },
+            required: ["selector"]
+        }
+    },
+    {
+        name: "fill_by_selector",
+        description: "FAST IDE TOOL. Focus, clear, and type text into a CSS selector with a compact response.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                selector: { type: "string" },
+                value: { type: "string" },
+                timeout: { type: "number", description: "Timeout in ms. Default 5000." }
+            },
+            required: ["selector", "value"]
+        }
+    },
+    {
+        name: "wait_for_selector",
+        description: "FAST IDE TOOL. Wait for a selector and return a compact boolean result.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                selector: { type: "string" },
+                timeout: { type: "number", description: "Timeout in ms. Default 5000." }
+            },
+            required: ["selector"]
+        }
+    },
+    {
+        name: "wait_for_text",
+        description: "FAST IDE TOOL. Wait until visible page text contains the expected string.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                text: { type: "string" },
+                timeout: { type: "number", description: "Timeout in ms. Default 5000." }
+            },
+            required: ["text"]
+        }
+    },
+    {
+        name: "get_network_errors",
+        description: "FAST IDE TOOL. Return recent failed network entries only, keeping debugging payloads small.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                limit: { type: "number", description: "Maximum errors to return. Default 20." }
+            }
+        }
+    },
+    {
+        name: "browser_intent",
+        description: "NATURAL IDE TOOL. Perform a high-level browser intent such as click, fill, select, check, wait_for, inspect, or navigate. Resolves targets by selector, role, text, aria-label, label, placeholder, name, and visibility before acting.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                intent: { type: "string", enum: ["click", "fill", "select", "check", "wait_for", "inspect", "navigate"] },
+                target: { type: "string", description: "Natural target such as 'login', 'Email', 'Submit', or a CSS selector." },
+                value: { type: "string", description: "Value for fill/select/navigate or expected text for wait_for." },
+                role: { type: "string", description: "Optional role hint such as button, link, textbox, checkbox, combobox." },
+                timeout: { type: "number", description: "Timeout in ms. Default 7000." },
+                verify: { type: "string", description: "Optional text to wait for after the action." },
+                includeCandidates: { type: "boolean", description: "Include resolver candidates for debugging. Default false." }
+            },
+            required: ["intent"]
+        }
+    },
+    {
+        name: "get_logs",
+        description: "FAST DEBUG TOOL. Return recent console logs, runtime exceptions, browser log entries, and JavaScript dialogs.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                limit: { type: "number", description: "Maximum log entries to return. Default 50." }
+            }
+        }
+    },
+    {
+        name: "detect_captcha",
+        description: "SAFE GUARD TOOL. Detect common CAPTCHA/human-verification widgets and report manual-solve requirement without interacting with them.",
+        inputSchema: { type: "object", properties: {} }
+    },
+    {
+        name: "solve_captcha",
+        description: "AUTO-SOLVE TOOL. Solves the CAPTCHA on the current page by simulating human mouse movement and clicking the widget (no API key needed). Works for Cloudflare Turnstile, reCAPTCHA v2 checkbox, hCaptcha. Set useService=true to fall back to a third-party solving service for image challenges.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                useService:     { type: "boolean", description: "Use third-party service instead of human simulation. Default false." },
+                service:        { type: "string", enum: ["2captcha", "capsolver"], description: "Service to use when useService=true. Default '2captcha'." },
+                apiKey:         { type: "string", description: "API key for the service. Defaults to env CAPTCHA_API_KEY." },
+                pageUrl:        { type: "string", description: "Page URL passed to the service. Defaults to current browser URL." },
+                waitAfterClick: { type: "number", description: "Ms to wait for captcha to clear after human click. Default 8000." },
+                timeout:        { type: "number", description: "Max wait for service solution in ms. Default 120000." },
+                pollInterval:   { type: "number", description: "Service poll interval in ms. Default 5000." }
+            }
+        }
+    },
+    {
+        name: "press_key",
+        description: "FAST IDE TOOL. Press a keyboard key or shortcut using native CDP key events.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                key: { type: "string", description: "Key such as Enter, Tab, Escape, Backspace, ArrowDown, or a single letter." },
+                modifiers: { type: "array", items: { type: "string" }, description: "Optional modifiers such as Ctrl, Shift, Alt, Meta." }
+            },
+            required: ["key"]
+        }
+    },
+    {
+        name: "click_text",
+        description: "FAST IDE TOOL. Click a visible element by text with optional role hint and compact post-action facts.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                text: { type: "string" },
+                role: { type: "string" },
+                timeout: { type: "number" }
+            },
+            required: ["text"]
+        }
+    },
+    {
+        name: "click_role",
+        description: "FAST IDE TOOL. Click a visible element by role and accessible name.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                role: { type: "string" },
+                name: { type: "string" },
+                timeout: { type: "number" }
+            },
+            required: ["role"]
+        }
+    },
+    {
+        name: "fill_label",
+        description: "FAST IDE TOOL. Fill a textbox-like field by visible/accessibility label with compact post-action facts.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                label: { type: "string" },
+                value: { type: "string" },
+                role: { type: "string" },
+                timeout: { type: "number" }
+            },
+            required: ["label", "value"]
+        }
+    },
+    {
+        name: "element_at_point",
+        description: "FAST DEBUG TOOL. Inspect the element that would receive a coordinate click.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                x: { type: "number" },
+                y: { type: "number" },
+                coordinate: { type: "string", description: "Alternative X,Y coordinate string." }
+            }
+        }
     },
     {
         name: "execute_script",
-        description: "Execute arbitrary JavaScript in the browser context.",
+        description: "Execute arbitrary JavaScript in the browser context. Tip: wrap your code in a block `{}` or IIFE to avoid `SyntaxError: Identifier has already been declared` when reusing variable names across multiple calls.",
         inputSchema: {
             type: "object",
             properties: { script: { type: "string" } },
@@ -169,10 +402,25 @@ const Tools = [
         description: "List all available browsers on the system.",
         inputSchema: { type: "object", properties: {} }
     },
+    {
+        name: "sample_visual_frames",
+        description: "VISION TOOL. Capture a few compressed screencast frames so the agent can inspect animation/video/dynamic UI without recording a large session.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                duration: { type: "number", description: "Sampling duration in ms. Default 1500, max 10000." },
+                maxFrames: { type: "number", description: "Maximum frames to return. Default 4, max 12." },
+                quality: { type: "number", description: "JPEG quality. Default 45." },
+                maxWidth: { type: "number", description: "Max frame width. Default 800." },
+                maxHeight: { type: "number", description: "Max frame height. Default 600." },
+                everyNthFrame: { type: "number", description: "CDP frame sampling interval. Default 3." }
+            }
+        }
+    },
     // ==================== AGENT-CENTRIC APIs ====================
     {
         name: "agent_action",
-        description: "Execute an action and optionally verify UI state. Unified action API that combines action + wait + verify in one call. Returns screenshot after action.",
+        description: "WARNING: Can return massive payloads (>100KB) with full DOM state and logs. Prefer using `act` for routine operations. Execute an action and optionally verify UI state. Unified action API that combines action + wait + verify in one call. Returns screenshot after action.",
         inputSchema: {
             type: "object",
             properties: {
@@ -211,6 +459,7 @@ const Tools = [
                         timeout: { type: "number" }
                     }
                 },
+                screenshot: { type: "boolean", description: "Return screenshot after action. Default false." },
                 timeout: { type: "number", description: "Timeout in ms (default: 10000)" }
             },
             required: ["action", "target"]
@@ -292,12 +541,15 @@ const Tools = [
     },
     {
         name: "page_snapshot",
-        description: "Capture rich page context optimized for LLM consumption. Returns interactive elements, forms, network state, logs, cookies, and storage in one call.",
+        description: "Capture page context optimized for LLM consumption. Lightweight by default; opt into screenshots, cookies, accessibility tree, or full DOM snapshot when needed.",
         inputSchema: {
             type: "object",
             properties: {
                 fullPage: { type: "boolean", description: "Full page screenshot (default: false)" },
-                includeDOMSnapshot: { type: "boolean", description: "Include full DOM snapshot (default: false)" }
+                includeDOMSnapshot: { type: "boolean", description: "Include full DOM snapshot (default: false)" },
+                screenshot: { type: "boolean", description: "Include screenshot. Default false." },
+                cookies: { type: "boolean", description: "Include cookies. Default false." },
+                accessibilityTree: { type: "boolean", description: "Include simplified accessibility tree. Default false." }
             }
         }
     }
@@ -364,8 +616,38 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                 return { content: [{ type: "text", text: `Available browsers:\n${list}` }] };
             }
 
+            if (name === "sample_visual_frames") {
+                const result = await bridge.sendCommand("sample_visual_frames", {
+                    duration: a?.duration,
+                    maxFrames: a?.maxFrames,
+                    quality: a?.quality,
+                    maxWidth: a?.maxWidth,
+                    maxHeight: a?.maxHeight,
+                    everyNthFrame: a?.everyNthFrame
+                });
+                const content: any[] = [{
+                    type: "text",
+                    text: JSON.stringify({
+                        success: result.success,
+                        frameCount: result.frameCount,
+                        duration: result.duration,
+                        timestamps: result.timestamps
+                    })
+                }];
+                for (const frame of result.frames || []) {
+                    content.push({ type: "image", data: frame, mimeType: "image/jpeg" });
+                }
+                return { content };
+            }
+
             if (name === "get_state") {
-                const result = await bridge.sendCommand("get_state", {});
+                const result = await bridge.sendCommand("get_state", {
+                    screenshot: a?.screenshot === true,
+                    domSnapshot: a?.domSnapshot === true || a?.includeDOMSnapshot === true,
+                    som: a?.som === true || a?.withOverlay === true,
+                    tabs: a?.tabs === true,
+                    elements: a?.elements !== false,
+                });
                 if (!result) throw new Error("Received empty state");
 
                 sessionHistory.unshift({ timestamp: new Date().toISOString(), title: result.title, url: result.url });
@@ -379,6 +661,148 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                 }
 
                 return { content };
+            }
+
+            if (name === "browser_status") {
+                const result = await bridge.sendCommand("browser_status", { includeTargets: a?.includeTargets });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "snapshot_compact") {
+                const result = await bridge.sendCommand("snapshot_compact", {
+                    maxElements: a?.maxElements,
+                    includeText: a?.includeText
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "list_interactive_elements") {
+                const result = await bridge.sendCommand("list_interactive_elements", {
+                    maxElements: a?.maxElements,
+                    withOverlay: a?.withOverlay
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "click_by_ref") {
+                const result = await bridge.sendCommand("click_by_ref", { ref: a.ref });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "click_by_selector") {
+                const result = await bridge.sendCommand("click_by_selector", {
+                    selector: a.selector,
+                    timeout: a?.timeout
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "fill_by_selector") {
+                const result = await bridge.sendCommand("fill_by_selector", {
+                    selector: a.selector,
+                    value: a.value,
+                    timeout: a?.timeout
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "wait_for_selector") {
+                const result = await bridge.sendCommand("wait_for_selector", {
+                    selector: a.selector,
+                    timeout: a?.timeout
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "wait_for_text") {
+                const result = await bridge.sendCommand("wait_for_text", {
+                    text: a.text,
+                    timeout: a?.timeout
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "get_network_errors") {
+                const result = await bridge.sendCommand("get_network_errors", { limit: a?.limit });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "browser_intent") {
+                const result = await bridge.sendCommand("browser_intent", {
+                    intent: a.intent,
+                    target: a?.target,
+                    value: a?.value,
+                    role: a?.role,
+                    timeout: a?.timeout,
+                    verify: a?.verify,
+                    includeCandidates: a?.includeCandidates
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "get_logs") {
+                const result = await bridge.sendCommand("get_logs", { limit: a?.limit });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "detect_captcha") {
+                const result = await bridge.sendCommand("detect_captcha", {});
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "solve_captcha") {
+                const result = await bridge.sendCommand("solve_captcha", {
+                    useService:     a?.useService,
+                    service:        a?.service,
+                    apiKey:         a?.apiKey,
+                    pageUrl:        a?.pageUrl,
+                    waitAfterClick: a?.waitAfterClick,
+                    timeout:        a?.timeout,
+                    pollInterval:   a?.pollInterval,
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "press_key") {
+                const result = await bridge.sendCommand("press_key", { key: a.key, modifiers: a?.modifiers });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "click_text") {
+                const result = await bridge.sendCommand("click_text", {
+                    text: a.text,
+                    role: a?.role,
+                    timeout: a?.timeout
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "click_role") {
+                const result = await bridge.sendCommand("click_role", {
+                    role: a.role,
+                    name: a?.name,
+                    timeout: a?.timeout
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "fill_label") {
+                const result = await bridge.sendCommand("fill_label", {
+                    label: a.label,
+                    value: a.value,
+                    role: a?.role,
+                    timeout: a?.timeout
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "element_at_point") {
+                const result = await bridge.sendCommand("element_at_point", {
+                    x: a?.x,
+                    y: a?.y,
+                    coordinate: a?.coordinate
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
             }
 
             if (name === "execute_script") {
@@ -397,7 +821,13 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                 
                 let currentState = { url: "unknown" };
                 try {
-                    currentState = await bridge.sendCommand("get_state", { screenshot: false });
+                    currentState = await bridge.sendCommand("get_state", {
+                        screenshot: false,
+                        domSnapshot: false,
+                        elements: false,
+                        som: false,
+                        tabs: false,
+                    });
                 } catch {}
 
                 const node: TaskNode = {
@@ -408,21 +838,52 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                 if (taskMemory.length > MAX_MEMORY) taskMemory.shift();
 
                 let resultMsg = "";
-                const eid = a.elementId ? String(a.elementId).replace('@', '') : undefined;
+                const eid = a.elementId ? String(a.elementId).replace(/@/g, '') : undefined;
                 
                 try {
                     if (action === "click") {
-                        if (eid) resultMsg = await bridge.sendCommand("click_element", { id: eid, text: a.value });
-                        else if (a.selector) resultMsg = await bridge.sendCommand("click_element_by_selector", { selector: a.selector });
-                        else if (a.coordinate) {
-                            const [x, y] = String(a.coordinate).split(',').map(Number);
-                            resultMsg = await bridge.sendCommand("click", { x, y });
-                        } else {
-                             resultMsg = await bridge.sendCommand(action, a);
+                        try {
+                            if (eid) resultMsg = await bridge.sendCommand("click_element", { id: eid, text: a.value });
+                            else if (a.selector) resultMsg = await bridge.sendCommand("click_element_by_selector", { selector: a.selector });
+                            else if (a.coordinate) {
+                                const [x, y] = String(a.coordinate).split(',').map(Number);
+                                resultMsg = await bridge.sendCommand("click", { x, y });
+                            } else {
+                                resultMsg = await bridge.sendCommand(action, a);
+                            }
+                        } catch (err) {
+                            // SELF-HEALING: Try fuzzy match if exact failed
+                            console.error(`[Aether] Action failed, attempting self-healing...`);
+                            const resolved = await bridge.resolveSelector({ 
+                                originalSelector: a.selector, 
+                                text: a.value || a.text 
+                            }).catch(() => null);
+                            
+                            if (resolved) {
+                                console.error(`[Aether] Self-healing resolved to: ${resolved.selector} (${resolved.method})`);
+                                resultMsg = await bridge.sendCommand("click_element_by_selector", { selector: resolved.selector });
+                            } else {
+                                throw err;
+                            }
                         }
                     } else if (action === "type") {
-                        if (eid || a.selector) await bridge.sendCommand(eid ? "click_element" : "click_element_by_selector", { id: eid, selector: a.selector });
-                        resultMsg = await bridge.sendCommand("type", { text: a.value || a.text });
+                        try {
+                            if (eid || a.selector) await bridge.sendCommand(eid ? "click_element" : "click_element_by_selector", { id: eid, selector: a.selector });
+                            resultMsg = await bridge.sendCommand("type", { text: a.value || a.text });
+                        } catch (err) {
+                            // SELF-HEALING
+                            const resolved = await bridge.resolveSelector({ 
+                                originalSelector: a.selector, 
+                                text: a.value || a.text 
+                            }).catch(() => null);
+                            
+                            if (resolved) {
+                                await bridge.sendCommand("click_element_by_selector", { selector: resolved.selector });
+                                resultMsg = await bridge.sendCommand("type", { text: a.value || a.text });
+                            } else {
+                                throw err;
+                            }
+                        }
                     } else if (action === "navigate") {
                         resultMsg = await bridge.sendCommand("navigate", { url: a.value });
                     } else {
@@ -445,7 +906,8 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                     target: a.target,
                     verify: a.verify,
                     waitFor: a.waitFor,
-                    timeout: a.timeout
+                    timeout: a.timeout,
+                    screenshot: a.screenshot === true
                 });
                 return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
             }
@@ -482,7 +944,10 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
             if (name === "page_snapshot") {
                 const result = await bridge.sendCommand("page_snapshot", {
                     fullPage: a.fullPage,
-                    includeDOMSnapshot: a.includeDOMSnapshot
+                    includeDOMSnapshot: a.includeDOMSnapshot,
+                    screenshot: a.screenshot === true,
+                    cookies: a.cookies === true,
+                    accessibilityTree: a.accessibilityTree === true
                 });
                 
                 const content: any[] = [
@@ -499,6 +964,9 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
 
             throw new Error(`Unknown tool: ${name}`);
         } catch (error: any) {
+            if (error.captcha) {
+                return { content: [{ type: "text", text: JSON.stringify(error.captcha) }], isError: true };
+            }
             if (error.message?.includes("not connected") || error.message?.includes("No active extension")) {
                 return { content: [{ type: "text", text: `Browser not connected. Use 'connect_browser' tool first to connect or launch Chrome.` }], isError: true };
             }
