@@ -14,170 +14,68 @@ Aether is a Model Context Protocol (MCP) server that lets AI coding agents inspe
 ## Quick Start
 
 ```bash
-cd server
+npx -y aether-mcp-server
+```
+
+Or install globally:
+
+```bash
+npm install -g aether-mcp-server
+aether-mcp-server
+```
+
+### MCP Client Config
+
+Add this to your MCP client (Cursor, Claude Code, Codex, KiloCode, etc.):
+
+```json
+{
+  "mcpServers": {
+    "aether-browser": {
+      "command": "npx",
+      "args": ["-y", "aether-mcp-server"]
+    }
+  }
+}
+```
+
+If installed globally:
+
+```json
+{
+  "mcpServers": {
+    "aether-browser": {
+      "command": "aether-mcp-server",
+      "args": []
+    }
+  }
+}
+```
+
+That's it. No cloning. No building. No absolute paths.
+
+### CLI Config Fields
+
+Some clients ask for command and arguments separately:
+
+| Field | Value |
+|---|---|
+| **Command** | `npx` |
+| **Arguments** | `-y aether-mcp-server` |
+
+### Install from source
+
+If you prefer to build from source:
+
+```bash
+git clone https://github.com/deviprasadshetty-dev/Aether.git
+cd Aether/server
 npm install
 npm run build
 node dist/index.js
 ```
 
-Most MCP clients should run the built server directly:
-
-```json
-{
-  "mcpServers": {
-    "aether-browser": {
-      "command": "node",
-      "args": ["D:/brain/reddit-bot/server/dist/index.js"]
-    }
-  }
-}
-```
-
-Replace the path with your own absolute path if the repository lives somewhere else.
-
-## One-Click Install
-
-The easiest install path is a small local script. It clones or updates Aether, installs dependencies, builds the server, and prints the MCP config entry.
-
-Windows PowerShell:
-
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/deviprasadshetty-dev/Aether---AI-Browser-Controller/main/scripts/install.ps1)))
-```
-
-macOS/Linux:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/deviprasadshetty-dev/Aether---AI-Browser-Controller/main/scripts/install.sh | bash
-```
-
-To also write into a specific MCP config file, pass the config path.
-
-Windows PowerShell:
-
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/deviprasadshetty-dev/Aether---AI-Browser-Controller/main/scripts/install.ps1))) -ConfigPath "$HOME\.cursor\mcp.json"
-```
-
-macOS/Linux:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/deviprasadshetty-dev/Aether---AI-Browser-Controller/main/scripts/install.sh | bash -s -- --config-path "$HOME/.cursor/mcp.json"
-```
-
-Use the actual config path for Cursor, Claude Code, Codex, or KiloCode on your machine. The script preserves existing `mcpServers` entries and only adds or updates `aether-browser`.
-
-### Cloudflare Workers
-
-Cloudflare Workers are useful for hosting a one-click installer page or redirecting to the latest raw install script. They are not a good place to run Aether itself because Aether needs:
-
-- stdio MCP transport to the local AI client
-- local Node.js execution
-- access to the user's local browser
-- Chrome DevTools Protocol ports
-- process launching for `launch_browser`
-- local filesystem paths for config and profile support
-
-A good Cloudflare Worker setup would be:
-
-```text
-install.aether.dev/windows  -> redirects to scripts/install.ps1
-install.aether.dev/unix     -> redirects to scripts/install.sh
-install.aether.dev          -> simple page with copy-paste commands
-```
-
-See `workers/install-redirect-worker.js` for a minimal Worker that does exactly this.
-
-Deploy it with Wrangler:
-
-```bash
-npx wrangler deploy
-```
-
-That gives a clean one-click distribution experience while the MCP server still runs where it must run: on the user's machine.
-
-## One-Prompt Install For Coding Agents
-
-Paste one of these prompts into Cursor, Claude Code, Codex, or KiloCode from the machine where you want Aether installed. The agent should clone/build this MCP server and add it to that tool's MCP configuration.
-
-### Cursor
-
-```text
-Install the Aether browser MCP server for Cursor.
-
-1. Clone or use this repository: <AETHER_REPO_URL_OR_LOCAL_PATH>
-2. In the server directory, run npm install and npm run build.
-3. Add an MCP server named "aether-browser" to Cursor's MCP config.
-4. Use command "node" and args ["<ABSOLUTE_PATH_TO_REPO>/server/dist/index.js"].
-5. Verify the config is valid JSON and tell me the exact config file you changed.
-```
-
-### Claude Code
-
-```text
-Install the Aether browser MCP server for Claude Code.
-
-1. Clone or use this repository: <AETHER_REPO_URL_OR_LOCAL_PATH>
-2. Run npm install and npm run build inside server.
-3. Add an MCP server named "aether-browser" that runs:
-   node <ABSOLUTE_PATH_TO_REPO>/server/dist/index.js
-4. Preserve any existing MCP servers in the config.
-5. Verify by showing the final aether-browser MCP entry.
-```
-
-### Codex
-
-```text
-Install the Aether browser MCP server for Codex.
-
-1. Clone or use this repository: <AETHER_REPO_URL_OR_LOCAL_PATH>
-2. Build it with:
-   cd server
-   npm install
-   npm run build
-3. Register an MCP server named "aether-browser" with command "node" and args ["<ABSOLUTE_PATH_TO_REPO>/server/dist/index.js"].
-4. Keep existing MCP configuration entries unchanged.
-5. Confirm the absolute path exists and the TypeScript build succeeds.
-```
-
-### KiloCode
-
-```text
-Install the Aether browser MCP server for KiloCode.
-
-1. Clone or use this repository: <AETHER_REPO_URL_OR_LOCAL_PATH>
-2. Run npm install and npm run build in the server directory.
-3. Add a KiloCode MCP entry named "aether-browser".
-4. Configure it to run:
-   node <ABSOLUTE_PATH_TO_REPO>/server/dist/index.js
-5. Do not remove existing MCP servers. Report the changed config path and the final entry.
-```
-
-## Common MCP Config Entry
-
-Use this entry if your MCP client accepts a JSON config:
-
-```json
-{
-  "aether-browser": {
-    "command": "node",
-    "args": ["<ABSOLUTE_PATH_TO_REPO>/server/dist/index.js"]
-  }
-}
-```
-
-Some clients wrap servers under `mcpServers`:
-
-```json
-{
-  "mcpServers": {
-    "aether-browser": {
-      "command": "node",
-      "args": ["<ABSOLUTE_PATH_TO_REPO>/server/dist/index.js"]
-    }
-  }
-}
-```
+Then configure your MCP client with the absolute path to `dist/index.js`.
 
 ## Browser Setup
 
