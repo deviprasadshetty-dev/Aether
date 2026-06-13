@@ -1,28 +1,25 @@
 # Aether — AI Browser Controller
 
-Aether is an MCP (Model Context Protocol) server that lets AI coding agents inspect and control a real browser through the Chrome DevTools Protocol (CDP). No browser extension needed.
+Give your AI agent a real browser. Aether is an MCP server that lets Claude, Cursor, Kilo Code, Codex, and other AI coding agents inspect and control a live browser through the Chrome DevTools Protocol — no extension needed.
 
 ## Install
 
 ```bash
-npx aether-mcp-server
+npx -y aether-mcp-server
 ```
 
 Or globally:
 
 ```bash
 npm install -g aether-mcp-server
-aether-mcp-server
 ```
 
 ## MCP Client Config
 
-Add this to your MCP client (Cursor, Claude Code, Codex, KiloCode, etc.):
-
 ```json
 {
   "mcpServers": {
-    "aether-browser": {
+    "aether": {
       "command": "npx",
       "args": ["-y", "aether-mcp-server"]
     }
@@ -35,7 +32,7 @@ If installed globally:
 ```json
 {
   "mcpServers": {
-    "aether-browser": {
+    "aether": {
       "command": "aether-mcp-server",
       "args": []
     }
@@ -43,40 +40,31 @@ If installed globally:
 }
 ```
 
-That's it. No cloning. No building. No absolute paths.
+No cloning. No building. No absolute paths.
 
 ## What It Does
 
 - Launches or connects to Chrome, Edge, Brave, or Firefox with remote debugging
-- Exposes MCP tools for navigation, clicking, typing, form filling, screenshots, tabs, logs, cookies, network controls, PDF printing, and page inspection
-- Uses native CDP input events instead of fragile DOM-only hacks
-- Provides Set-of-Marks style visual element references for screenshot-based workflows
-- Resolves elements by selector, text, role, accessible name, label, placeholder, XPath, coordinates, same-origin iframe content, and shadow DOM content
-- Caches compact page snapshots and invalidates them on DOM/navigation/runtime events
+- Click by text, role, label, or placeholder — not fragile CSS selectors
+- Native CDP keyboard and mouse events, not DOM simulation
+- Smart page snapshots that auto-invalidate on DOM changes
+- Set-of-Marks visual element references for screenshot-based workflows
+- Shadow DOM and same-origin iframe support built in
 
 ## Browser Setup
 
-Launch a clean browser automatically:
-
 ```
 launch_browser()
-```
-
-Pick a specific browser:
-
-```
 launch_browser(browser="chrome")
 launch_browser(browser="edge")
 launch_browser(browser="brave")
 ```
 
-Connect to an existing browser with remote debugging:
+Connect to an existing browser:
 
 ```bash
 chrome --remote-debugging-port=9222
 ```
-
-Then:
 
 ```
 connect_browser(mode="connect", port=9222)
@@ -84,31 +72,20 @@ connect_browser(mode="connect", port=9222)
 
 ## Key Tools
 
-- `browser_status` — connection and active tab status
-- `snapshot_compact` — title, URL, readyState, and interactive element list
-- `list_interactive_elements` — element refs for click/fill flows
-- `click_by_ref` — click refs returned by compact snapshots
-- `click_text`, `click_role`, `fill_label` — semantic actions powered by the locator engine
-- `get_state` — optional screenshot, tabs, DOM snapshot, and elements
-- `get_logs`, `get_network_errors` — compact debugging output
-- `act` — broad compatibility action tool
+| Tool | What it does |
+|---|---|
+| `browser_status` | Connection and active tab status |
+| `snapshot_compact` | Fast title, URL, and interactive element list |
+| `list_interactive_elements` | Element refs for click/fill flows |
+| `click_text`, `click_role`, `fill_label` | Semantic actions |
+| `click_by_ref`, `fill_by_selector` | Direct element targeting |
+| `get_state` | Screenshot, tabs, DOM snapshot |
+| `get_logs`, `get_network_errors` | Live debugging output |
+| `act` | Broad compatibility action tool |
 
 ## Project-Local Learning
 
-Aether stores learned lessons and skills in `.aether/` inside your project:
-
-```
-<project>/.aether/
-  memory/
-    lessons.jsonl
-    learned.json
-  skills/
-    <skill-name>/SKILL.md
-    _registry.json
-  memory-config.json
-```
-
-Call `configure_aether_memory` with your project root to enable it. Aether creates `.aether/` and adds it to `.gitignore`.
+Aether stores learned lessons and reusable skills inside your project under `.aether/` — lightweight automation notes that make future runs faster. Call `configure_aether_memory` with your project root to enable it.
 
 ## Environment Variables
 
@@ -120,21 +97,7 @@ Call `configure_aether_memory` with your project root to enable it. Aether creat
 ## Requirements
 
 - Node.js >= 18
-- Chrome, Edge, Brave, or Firefox installed locally
-
-## Architecture
-
-```
-AI Agent / MCP Client
-        |
-        | stdio JSON-RPC
-        v
-Aether MCP Server
-        |
-        | Chrome DevTools Protocol
-        v
-Browser Target
-```
+- Chrome, Edge, Brave, or Firefox
 
 ## License
 
