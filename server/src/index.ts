@@ -18,9 +18,17 @@ async function shutdown() {
     process.exit(0);
 }
 
-// Handle shutdown signals
+// Handle shutdown signals and crash events
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+process.on("uncaughtException", (err) => {
+    console.error("[Server] Uncaught Exception:", err);
+    shutdown();
+});
+process.on("unhandledRejection", (reason, promise) => {
+    console.error("[Server] Unhandled Rejection at:", promise, "reason:", reason);
+    shutdown();
+});
 process.on("exit", () => {
     const client = getCdpClient();
     if (client.isConnected()) {

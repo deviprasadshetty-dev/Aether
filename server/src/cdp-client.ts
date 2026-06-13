@@ -26,6 +26,17 @@ interface WaitForSelectorOptions {
     stable?: boolean;
 }
 
+type BrowserName = 'chrome' | 'edge' | 'brave' | 'firefox';
+
+export interface BrowserProfile {
+    browser: BrowserName;
+    id: string;
+    name: string;
+    directory: string;
+    userDataDir: string;
+    lastActive?: number;
+}
+
 export class CdpClient {
     private ws: WebSocket | null = null;
     private messageId = 0;
@@ -67,6 +78,7 @@ export class CdpClient {
     async launch(options?: {
         headless?: boolean;
         userDataDir?: string;
+        profileDirectory?: string;
         port?: number;
         extraArgs?: string[];
     }): Promise<void> {
@@ -252,7 +264,21 @@ export class CdpClient {
         const result = await this.sendCommand("Runtime.evaluate", {
             expression: `
                 (function() {
-                    // Find interactive elements
+                    const withSoM = ${JSON.stringify(withSoM)};
+                    
+                    // Remove existing overlays
+                    const oldContainer = document.getElementById('aether-som-container');
+                    if (oldContainer) oldContainer.remove();
+                    document.querySelectorAll('.aether-som-marker').forEach(el => el.remove());
+
+                    let container = null;
+                    if (withSoM) {
+                        container = document.createElement('div');
+                        container.id = 'aether-som-container';
+                        container.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 2147483647; pointer-events: none;';
+                        document.documentElement.appendChild(container);
+                    }
+
                     const selectors = [
                         'a[href]', 'button', 'input:not([type="hidden"])', 'select', 'textarea',
                         '[onclick]', '[role="button"]', '[role="link"]', '[role="checkbox"]',
@@ -260,14 +286,17 @@ export class CdpClient {
                     ].join(', ');
                     
                     const elements = Array.from(document.querySelectorAll(selectors));
-                    const rect = document.documentElement.getBoundingClientRect();
+                    const docRect = document.documentElement.getBoundingClientRect();
                     
-                    const items = elements.map((el, idx) => {
+                    let validIndex = 0;
+                    const items = elements.map((el) => {
                         const r = el.getBoundingClientRect();
                         const computed = window.getComputedStyle(el);
                         if (computed.display === 'none' || computed.visibility === 'hidden' || r.width === 0 || r.height === 0) {
                             return null;
                         }
+                        
+                        validIndex++;
                         
                         // Get text content
                         let text = el.innerText || el.textContent || '';
@@ -275,18 +304,38 @@ export class CdpClient {
                         
                         // Get selector
                         let selector = '';
-                        if (el.id) selector = '#' + el.id;
+                        if (el.id) selector = '#' + CSS.escape(el.id);
                         else if (el.className && typeof el.className === 'string') selector = '.' + el.className.split(' ')[0];
                         else selector = el.tagName.toLowerCase();
                         
+                        if (withSoM && container) {
+                            const id = String(validIndex);
+                            const w = Math.max(20, id.length * 8 + 14);
+                            const marker = document.createElement('div');
+                            marker.className = 'aether-som-marker';
+                            marker.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="20" style="display:block">'
+                                + '<rect width="' + w + '" height="20" rx="10" fill="#1e40af"/>'
+                                + '<text x="' + (w / 2) + '" y="10" dominant-baseline="central" text-anchor="middle" font-family="ui-monospace,monospace" font-size="11" font-weight="700" fill="white">' + id + '</text>'
+                                + '</svg>';
+                            marker.style.cssText = \`
+                                position: absolute;
+                                left: \${r.left}px;
+                                top: \${r.top}px;
+                                pointer-events: none;
+                                filter: drop-shadow(0 1px 4px rgba(0,0,0,0.35));
+                                transform: translate(-4px, -4px);
+                            \`;
+                            container.appendChild(marker);
+                        }
+
                         return {
-                            id: idx + 1,
+                            id: validIndex,
                             tag: el.tagName.toLowerCase(),
                             text: text,
                             selector: selector,
                             bounds: { 
-                                x: Math.max(0, r.left - rect.left), 
-                                y: Math.max(0, r.top - rect.top), 
+                                x: Math.max(0, r.left - docRect.left), 
+                                y: Math.max(0, r.top - docRect.top), 
                                 width: r.width, 
                                 height: r.height 
                             },
@@ -299,57 +348,15 @@ export class CdpClient {
                         };
                     }).filter(x => x !== null);
                     
-                    return items;
+                    return { items, somInjected: !!(withSoM && container) };
                 })()
             `,
             returnByValue: true,
             awaitPromise: true,
         });
 
-        const elements = result.result?.value || [];
-
-        let somInjected = false;
-        
-        if (withSoM && elements.length > 0) {
-            // Inject SoM overlay
-            await this.sendCommand("Runtime.evaluate", {
-                expression: `
-                    (function() {
-                        // Remove existing overlays
-                        document.querySelectorAll('.aether-som-marker').forEach(el => el.remove());
-                        
-                        const elements = ${JSON.stringify(elements)};
-                        
-                        elements.forEach(el => {
-                            const id = String(el.id);
-                            const w = Math.max(20, id.length * 8 + 14);
-                            const marker = document.createElement('div');
-                            marker.className = 'aether-som-marker';
-                            marker.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="20" style="display:block">'
-                                + '<rect width="' + w + '" height="20" rx="10" fill="#1e40af"/>'
-                                + '<text x="' + (w / 2) + '" y="10" dominant-baseline="central" text-anchor="middle" font-family="ui-monospace,monospace" font-size="11" font-weight="700" fill="white">' + id + '</text>'
-                                + '</svg>';
-                            marker.style.cssText = \`
-                                position: absolute;
-                                left: \${el.bounds.x}px;
-                                top: \${el.bounds.y}px;
-                                z-index: 2147483647;
-                                pointer-events: none;
-                                filter: drop-shadow(0 1px 4px rgba(0,0,0,0.35));
-                                transform: translate(-4px, -4px);
-                            \`;
-                            document.body.appendChild(marker);
-                        });
-                        
-                        return true;
-                    })()
-                `,
-                returnByValue: true,
-            });
-            somInjected = true;
-        }
-
-        return { elements, somInjected };
+        const val = result.result?.value || { items: [], somInjected: false };
+        return { elements: val.items, somInjected: val.somInjected };
     }
 
     /**
@@ -358,6 +365,8 @@ export class CdpClient {
     async removeSoMOverlay(): Promise<void> {
         await this.sendCommand("Runtime.evaluate", {
             expression: `
+                const container = document.getElementById('aether-som-container');
+                if (container) container.remove();
                 document.querySelectorAll('.aether-som-marker').forEach(el => el.remove());
             `,
         });
@@ -1093,13 +1102,28 @@ async takeHeapSnapshot(reportProgress?: boolean, treatGlobalObjectsAsRoots?: boo
     await this.sendCommand("HeapProfiler.takeHeapSnapshot", { reportProgress, treatGlobalObjectsAsRoots, captureNumericValue });
 }
 
-/**
- * Click at coordinates with human-like timing and micro-jitter.
- */
-async click(x: number, y: number, button: "left" | "middle" | "right" = "left"): Promise<void> {
+    // Simple multi-octave noise function (fractional Brownian motion approximation)
+    private fBm(t: number, octaves: number = 3): number {
+        let value = 0;
+        let amplitude = 1.0;
+        let frequency = 1.0;
+        let maxValue = 0;
+        for (let j = 0; j < octaves; j++) {
+            value += Math.sin(t * frequency * Math.PI * 2 + (j * 12.34)) * amplitude;
+            maxValue += amplitude;
+            amplitude *= 0.5;
+            frequency *= 2.0;
+        }
+        return value / maxValue;
+    }
+
+    /**
+     * Click at coordinates with human-like timing, micro-jitter, and optional target width.
+     */
+    async click(x: number, y: number, button: "left" | "middle" | "right" = "left", targetWidth?: number): Promise<void> {
         const targetX = Math.round(Number(x));
         const targetY = Math.round(Number(y));
-        await this.moveMouse(targetX, targetY);
+        await this.moveMouse(targetX, targetY, targetWidth);
 
         // Pre-click hover pause — humans don't instantly press after arriving
         await new Promise((r) => setTimeout(r, 80 + Math.random() * 140));
@@ -1119,9 +1143,9 @@ async click(x: number, y: number, button: "left" | "middle" | "right" = "left"):
     }
 
     /**
-     * Move mouse along a cubic Bezier arc — human-like curve, variable speed, micro-jitter.
+     * Move mouse along a cubic Bezier arc with Fitts's Law duration and fractional Brownian motion tremors.
      */
-    async moveMouse(x: number, y: number): Promise<void> {
+    async moveMouse(x: number, y: number, targetWidth?: number): Promise<void> {
         const targetX = Math.round(Number(x));
         const targetY = Math.round(Number(y));
         const start = this.mousePosition ?? { x: targetX, y: targetY };
@@ -1132,8 +1156,13 @@ async click(x: number, y: number, button: "left" | "middle" | "right" = "left"):
             return;
         }
 
-        // ~1 step per 5px, clamped 15-55 steps
-        const steps = Math.max(15, Math.min(55, Math.round(dist / 5)));
+        // Fitts's Law: MT = a + b * log2(2D / W)
+        const w = targetWidth ?? 30; // default target width to 30px
+        const indexDifficulty = Math.log2(Math.max(1, (2 * dist) / w));
+        const movementTime = 150 + 95 * indexDifficulty; // Fitts's MT in ms
+
+        // Human updates motor position every 10-15ms. Compute dynamic step count.
+        const steps = Math.max(12, Math.min(60, Math.round(movementTime / 12)));
 
         // Random cubic Bezier control points — creates an organic arc
         const angle  = Math.atan2(targetY - start.y, targetX - start.x) + Math.PI / 2;
@@ -1151,6 +1180,10 @@ async click(x: number, y: number, button: "left" | "middle" | "right" = "left"):
 
         await this.updateMouseOverlay(start.x, start.y).catch(() => {});
 
+        // Unique noise seed for this movement path
+        const seedX = Math.random() * 100;
+        const seedY = Math.random() * 100;
+
         for (let i = 1; i <= steps; i++) {
             const t = i / steps;
             // Ease-in-out: slow start, fast middle, slow near target
@@ -1159,18 +1192,24 @@ async click(x: number, y: number, button: "left" | "middle" | "right" = "left"):
             const px = u*u*u*start.x + 3*u*u*e*cp1.x + 3*u*e*e*cp2.x + e*e*e*targetX;
             const py = u*u*u*start.y + 3*u*u*e*cp1.y + 3*u*e*e*cp2.y + e*e*e*targetY;
 
-            // Per-step micro-jitter simulates hand tremor
-            const cx = Math.round(px + (Math.random() - 0.5) * 1.2);
-            const cy = Math.round(py + (Math.random() - 0.5) * 1.2);
+            // fractional Brownian motion noise walk (muscle tremor)
+            const tremorAmplitude = 1.2;
+            const noiseX = this.fBm(t * 8 + seedX, 3) * tremorAmplitude;
+            const noiseY = this.fBm(t * 8 + seedY, 3) * tremorAmplitude;
+
+            const cx = Math.round(px + noiseX);
+            const cy = Math.round(py + noiseY);
 
             await this.sendCommand("Input.dispatchMouseEvent", {
                 type: "mouseMoved", x: cx, y: cy, button: "none", pointerType: "mouse",
             });
             await this.updateMouseOverlay(cx, cy).catch(() => {});
 
-            // Variable step delay: faster mid-arc, slower as approaching target
-            const nearEnd = i > steps * 0.82;
-            await new Promise((r) => setTimeout(r, nearEnd ? 8 + Math.random() * 16 : 2 + Math.random() * 6));
+            // Velocity profile delay: faster in the middle, slower at start/end
+            const velocityWeight = Math.sin(t * Math.PI); // bell curve 0 -> 1 -> 0
+            const stepDelay = 2 + (1 - velocityWeight) * 12 + Math.random() * 4;
+
+            await new Promise((r) => setTimeout(r, stepDelay));
         }
 
         this.mousePosition = { x: targetX, y: targetY };
@@ -1324,12 +1363,56 @@ async click(x: number, y: number, button: "left" | "middle" | "right" = "left"):
         }
     }
 
-    /**
-     * Type text character-by-character with human-like WPM variance and thinking pauses.
-     */
     async typeText(text: string): Promise<void> {
+        const ADJACENT_KEYS: Record<string, string> = {
+            'a': 'qwsz',
+            'b': 'vghn',
+            'c': 'xdfv',
+            'd': 'ersfxc',
+            'e': 'wsdr',
+            'f': 'rtgvcd',
+            'g': 'tyhbvf',
+            'h': 'yujnbg',
+            'i': 'ujko',
+            'j': 'uikmnh',
+            'k': 'ijlm',
+            'l': 'okp',
+            'm': 'njk',
+            'n': 'bhjm',
+            'o': 'iklp',
+            'p': 'ol',
+            'q': 'wa',
+            'r': 'edft',
+            's': 'wedxza',
+            't': 'rfgy',
+            'u': 'yhji',
+            'v': 'cfgb',
+            'w': 'qase',
+            'x': 'zsdc',
+            'y': 'tghu',
+            'z': 'asx',
+        };
+
         for (let i = 0; i < text.length; i++) {
             const ch = text[i];
+            const lowerCh = ch.toLowerCase();
+
+            // ~1.5% chance of typo on lowercase QWERTY letters
+            if (ADJACENT_KEYS[lowerCh] && Math.random() < 0.015) {
+                const adjList = ADJACENT_KEYS[lowerCh];
+                const typoCh = adjList[Math.floor(Math.random() * adjList.length)];
+                const resolvedTypo = ch === ch.toUpperCase() ? typoCh.toUpperCase() : typoCh;
+
+                // Type the typo first
+                await this.sendCommand("Input.insertText", { text: resolvedTypo });
+                // Natural pause for reaction time before correcting
+                await new Promise((r) => setTimeout(r, 120 + Math.random() * 150));
+                // Delete typo
+                await this.pressKey("Backspace");
+                // Short typing recovery pause
+                await new Promise((r) => setTimeout(r, 80 + Math.random() * 100));
+            }
+
             await this.sendCommand("Input.insertText", { text: ch });
 
             // Base inter-key delay (~55-90 WPM range)
@@ -1528,18 +1611,123 @@ async click(x: number, y: number, button: "left" | "middle" | "right" = "left"):
     /**
      * Find first available browser from installed browsers
      */
-    async findAvailableBrowser(): Promise<{ name: 'chrome' | 'edge' | 'brave' | 'firefox'; path: string } | null> {
+    async findAvailableBrowser(): Promise<{ name: BrowserName; path: string } | null> {
         const browsers = this.getBrowserPaths();
         
         for (const browser of browsers) {
             for (const p of browser.paths) {
                 try {
                     await fs.access(p);
-                    return { name: browser.name as 'chrome' | 'edge' | 'brave' | 'firefox', path: p };
+                    return { name: browser.name as BrowserName, path: p };
                 } catch {}
             }
         }
         return null;
+    }
+
+    private getDefaultUserDataDir(browser: BrowserName): string | null {
+        const platform = os.platform();
+        if (platform === "win32") {
+            const local = process.env.LOCALAPPDATA;
+            if (!local) return null;
+            if (browser === "brave") return path.join(local, "BraveSoftware", "Brave-Browser", "User Data");
+            if (browser === "chrome") return path.join(local, "Google", "Chrome", "User Data");
+            if (browser === "edge") return path.join(local, "Microsoft", "Edge", "User Data");
+            return null;
+        }
+        if (platform === "darwin") {
+            const home = os.homedir();
+            if (browser === "brave") return path.join(home, "Library", "Application Support", "BraveSoftware", "Brave-Browser");
+            if (browser === "chrome") return path.join(home, "Library", "Application Support", "Google", "Chrome");
+            if (browser === "edge") return path.join(home, "Library", "Application Support", "Microsoft Edge");
+            return null;
+        }
+
+        const config = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+        if (browser === "brave") return path.join(config, "BraveSoftware", "Brave-Browser");
+        if (browser === "chrome") return path.join(config, "google-chrome");
+        if (browser === "edge") return path.join(config, "microsoft-edge");
+        return null;
+    }
+
+    async listBrowserProfiles(browser: BrowserName = "brave"): Promise<BrowserProfile[]> {
+        const userDataDir = this.getDefaultUserDataDir(browser);
+        if (!userDataDir) return [];
+
+        const localStatePath = path.join(userDataDir, "Local State");
+        let localState: any;
+        try {
+            localState = JSON.parse(await fs.readFile(localStatePath, "utf8"));
+        } catch {
+            return [];
+        }
+
+        const infoCache = localState?.profile?.info_cache || {};
+        const ordered = localState?.profile?.profiles_order || Object.keys(infoCache);
+        const profiles: BrowserProfile[] = [];
+
+        for (const directory of ordered) {
+            const cache = infoCache[directory] || {};
+            const profilePath = path.join(userDataDir, directory);
+            try {
+                const stat = await fs.stat(profilePath);
+                if (!stat.isDirectory()) continue;
+            } catch {
+                continue;
+            }
+
+            const name = cache.name || cache.shortcut_name || directory;
+            profiles.push({
+                browser,
+                id: `${browser}:${directory}`,
+                name,
+                directory,
+                userDataDir,
+                lastActive: typeof cache.active_time === "number" ? cache.active_time : undefined,
+            });
+        }
+
+        return profiles;
+    }
+
+    private async resolveBrowserProfile(options?: {
+        browser?: BrowserName;
+        profile?: string;
+        profileDirectory?: string;
+        userDataDir?: string;
+    }): Promise<{ userDataDir?: string; profileDirectory?: string; profileName?: string }> {
+        if (options?.profileDirectory) {
+            return {
+                userDataDir: options.userDataDir,
+                profileDirectory: options.profileDirectory,
+                profileName: options.profileDirectory,
+            };
+        }
+
+        const profile = options?.profile?.trim();
+        if (!profile) {
+            return { userDataDir: options?.userDataDir };
+        }
+
+        const browser = options?.browser || "brave";
+        const profiles = await this.listBrowserProfiles(browser);
+        const normalized = profile.toLowerCase();
+        const match = profiles.find((p) =>
+            p.directory.toLowerCase() === normalized ||
+            p.name.toLowerCase() === normalized ||
+            p.id.toLowerCase() === `${browser}:${normalized}`
+        );
+
+        if (!match) {
+            const available = profiles.map((p) => `${p.name} (${p.directory})`).join(", ") || "none found";
+            throw new Error(`Profile "${profile}" not found for ${browser}. Available profiles: ${available}`);
+        }
+
+        return {
+            userDataDir: options?.userDataDir || match.userDataDir,
+            profileDirectory: match.directory,
+            profileName: match.name,
+        };
     }
 
     /**
@@ -1548,8 +1736,10 @@ async click(x: number, y: number, button: "left" | "middle" | "right" = "left"):
     async launchAuto(options?: {
         headless?: boolean;
         userDataDir?: string;
+        profile?: string;
+        profileDirectory?: string;
         port?: number;
-        browser?: 'chrome' | 'edge' | 'brave' | 'firefox';
+        browser?: BrowserName;
         extraArgs?: string[];
     }): Promise<void> {
         const port = options?.port ?? 9222;
@@ -1586,7 +1776,13 @@ async click(x: number, y: number, button: "left" | "middle" | "right" = "left"):
             console.error(`[CDP] Auto-detected browser: ${browserName}`);
         }
 
-        const userDataDir = options?.userDataDir ?? path.join(os.tmpdir(), `aether-${browserName}-profile`);
+        const profile = await this.resolveBrowserProfile({
+            browser: browserName,
+            profile: options?.profile,
+            profileDirectory: options?.profileDirectory,
+            userDataDir: options?.userDataDir,
+        });
+        const userDataDir = profile.userDataDir ?? path.join(os.tmpdir(), `aether-${browserName}-profile`);
         const headless = options?.headless ?? false;
 
         const args: string[] = [];
@@ -1605,7 +1801,7 @@ async click(x: number, y: number, button: "left" | "middle" | "right" = "left"):
             args.push(
                 `--remote-debugging-port=${port}`,
                 `--user-data-dir=${userDataDir}`,
-                "--disable-blink-features=AutomationControlled",
+                ...(profile.profileDirectory ? [`--profile-directory=${profile.profileDirectory}`] : []),
                 "--disable-infobars",
                 ...(headless ? ["--headless", "--disable-gpu"] : []),
                 ...(options?.extraArgs || []),

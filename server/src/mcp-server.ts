@@ -2,27 +2,140 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { getCdpBridge } from "./cdp-bridge";
-import { getCdpClient } from "./cdp-client";
+import { McpTaskMemory } from "./mcp-task-memory";
+import { jsonContent, toolError } from "./mcp-responses";
+import { AetherMemoryStore } from "./aether-memory-store";
 
-interface TaskNode {
-    id: string;
-    action: string;
-    url: string;
-    timestamp: string;
-    parentId?: string;
-    status: 'success' | 'failure' | 'pending';
-    error?: string;
-}
-
-const taskMemory: TaskNode[] = [];
-const sessionHistory: any[] = [];
-const MAX_MEMORY = 100;
+const taskMemory = new McpTaskMemory();
+const aetherMemory = new AetherMemoryStore();
 
 const Tools = [
     {
         name: "get_task_graph",
         description: "Retrieve the hierarchical task graph for the current session (Aether v2 Task Orbit).",
         inputSchema: { type: "object", properties: {} },
+    },
+    {
+        name: "configure_aether_memory",
+        description: "Initialize project-local Aether learning in <project>/.aether and add .aether/ to .gitignore. Use before storing or recalling repo-specific lessons and SKILL.md skills.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                projectRoot: { type: "string", description: "Absolute path to the project/repo root. Defaults to AETHER_PROJECT_ROOT or the MCP process cwd." }
+            }
+        }
+    },
+    {
+        name: "remember_aether_lesson",
+        description: "Store a compact reusable lesson after a complex success, recovered error, user correction, or non-trivial workflow discovery. Stores only distilled issue/solution learning in project-local .aether.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                projectRoot: { type: "string" },
+                title: { type: "string" },
+                trigger: { type: "string", description: "When this lesson should be considered again." },
+                problemPattern: { type: "string", description: "Reusable failure pattern or friction that appeared." },
+                symptoms: { type: "array", items: { type: "string" } },
+                failedApproach: { type: "string" },
+                betterApproach: { type: "string", description: "The reusable better way Aether learned." },
+                createdBecause: {
+                    type: "string",
+                    enum: [
+                        "complex_task_succeeded",
+                        "errors_overcome",
+                        "user_corrected_approach_worked",
+                        "non_trivial_workflow_discovered",
+                        "user_asked_to_remember"
+                    ]
+                },
+                evidence: { type: "string" },
+                tags: { type: "array", items: { type: "string" } },
+                confidence: { type: "number" }
+            },
+            required: ["title", "trigger", "problemPattern", "betterApproach", "createdBecause"]
+        }
+    },
+    {
+        name: "recall_aether_memory",
+        description: "Recall relevant project-local Aether lessons by intent, problem, or tags. Returns compact issue/solution records from .aether only.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                projectRoot: { type: "string" },
+                intent: { type: "string" },
+                problem: { type: "string" },
+                tags: { type: "array", items: { type: "string" } },
+                limit: { type: "number" }
+            }
+        }
+    },
+    {
+        name: "record_aether_lesson_outcome",
+        description: "Update confidence for a stored Aether lesson after it succeeds or fails later.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                projectRoot: { type: "string" },
+                id: { type: "string" },
+                success: { type: "boolean" },
+                evidence: { type: "string" }
+            },
+            required: ["id", "success"]
+        }
+    },
+    {
+        name: "create_aether_skill",
+        description: "Create or replace a project-local Claude-style skill at .aether/skills/<name>/SKILL.md for reusable procedures Aether should apply in this repo.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                projectRoot: { type: "string" },
+                name: { type: "string", description: "Lowercase hyphenated skill name; normalized if needed." },
+                description: { type: "string", description: "Frontmatter description with what the skill does and when to use it." },
+                trigger: { type: "string", description: "Concise body text explaining when to apply the procedure." },
+                procedure: { type: "array", items: { type: "string" } },
+                examples: { type: "array", items: { type: "string" } },
+                edgeCases: { type: "array", items: { type: "string" } },
+                verification: { type: "array", items: { type: "string" } }
+            },
+            required: ["name", "description", "trigger", "procedure"]
+        }
+    },
+    {
+        name: "list_aether_skills",
+        description: "List project-local Aether SKILL.md procedures and their maintenance state.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                projectRoot: { type: "string" }
+            }
+        }
+    },
+    {
+        name: "maintain_aether_skill",
+        description: "Maintain a project-local Aether skill: keep valuable skills, patch outdated instructions, consolidate near-duplicates, or prune stale skills.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                projectRoot: { type: "string" },
+                name: { type: "string" },
+                action: { type: "string", enum: ["keep", "patch", "consolidate", "prune"] },
+                reason: { type: "string" },
+                patchBody: { type: "string", description: "Full replacement SKILL.md content when action=patch." },
+                consolidateInto: { type: "string", description: "Target skill name when action=consolidate." }
+            },
+            required: ["name", "action", "reason"]
+        }
+    },
+    {
+        name: "compact_aether_memory",
+        description: "Prune and compact project-local Aether memory according to caps, then refresh .aether/memory/learned.json.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                projectRoot: { type: "string" }
+            }
+        }
     },
     {
         name: "act",
@@ -65,6 +178,7 @@ const Tools = [
                 visible: { type: "boolean", description: "Require visible selector when waiting. Default varies by action." },
                 stable: { type: "boolean", description: "Require stable element bounds when waiting. Default varies by action." },
                 parentId: { type: "string", description: "Parent task ID for hierarchical tracking (UFO3)." },
+                projectRoot: { type: "string", description: "Optional project root for recording distilled Aether lessons when recovery succeeds." },
                 tabId: { type: "number", description: "Tab ID for switching/closing." },
                 files: { type: "array", items: { type: "string" }, description: "Files for upload_file action" },
                 modifiers: { type: "array", items: { type: "string" }, description: "Key modifiers (Ctrl, Alt, etc.)" },
@@ -373,10 +487,13 @@ const Tools = [
         inputSchema: {
             type: "object",
             properties: {
-                mode: { type: "string", enum: ["connect", "launch", "auto"], description: "Connect to existing or launch new instance (auto = detect & launch)." },
+                mode: { type: "string", enum: ["connect", "launch", "auto", "ask"], description: "Connect to existing, launch new instance, or return selectable launch choices." },
                 port: { type: "number", description: "Browser debugging port (default: 9222)." },
                 headless: { type: "boolean", description: "Run in headless mode (only for launch mode)." },
-                browser: { type: "string", enum: ["chrome", "edge", "brave", "firefox"], description: "Browser to use (default: auto-detect)." }
+                browser: { type: "string", enum: ["chrome", "edge", "brave", "firefox"], description: "Browser to use (default: auto-detect, or brave when profile is set)." },
+                profile: { type: "string", description: "Named browser profile to launch, e.g. Personal or Work. Defaults browser to brave when set." },
+                profileDirectory: { type: "string", description: "Exact Chromium profile directory, e.g. Default or Profile 1." },
+                userDataDir: { type: "string", description: "Chromium user data root to use with profileDirectory." }
             }
         }
     },
@@ -388,7 +505,10 @@ const Tools = [
             properties: {
                 browser: { type: "string", enum: ["chrome", "edge", "brave", "firefox"], description: "Browser to launch (default: auto-detect first available)." },
                 headless: { type: "boolean", description: "Run in headless mode." },
-                port: { type: "number", description: "Debugging port (default: 9222)." }
+                port: { type: "number", description: "Debugging port (default: 9222)." },
+                profile: { type: "string", description: "Named browser profile to launch, e.g. Personal or Work. Defaults browser to brave when set." },
+                profileDirectory: { type: "string", description: "Exact Chromium profile directory, e.g. Default or Profile 1." },
+                userDataDir: { type: "string", description: "Chromium user data root to use with profileDirectory." }
             }
         }
     },
@@ -401,6 +521,16 @@ const Tools = [
         name: "list_browsers",
         description: "List all available browsers on the system.",
         inputSchema: { type: "object", properties: {} }
+    },
+    {
+        name: "list_browser_profiles",
+        description: "List Chromium profiles that can be launched with browser control. Defaults to Brave.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                browser: { type: "string", enum: ["chrome", "edge", "brave"], description: "Browser profile store to inspect. Default: brave." }
+            }
+        }
     },
     {
         name: "sample_visual_frames",
@@ -565,39 +695,189 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
 
         try {
             if (name === "get_task_graph") {
-                return { content: [{ type: "text", text: JSON.stringify(taskMemory, null, 2) }] };
+                return jsonContent(taskMemory.graph(), true);
+            }
+
+            if (name === "configure_aether_memory") {
+                return jsonContent(await aetherMemory.configure(a?.projectRoot), true);
+            }
+
+            if (name === "remember_aether_lesson") {
+                return jsonContent(await aetherMemory.rememberLesson({
+                    projectRoot: a?.projectRoot,
+                    title: a.title,
+                    trigger: a.trigger,
+                    problemPattern: a.problemPattern,
+                    symptoms: a?.symptoms,
+                    failedApproach: a?.failedApproach,
+                    betterApproach: a.betterApproach,
+                    createdBecause: a.createdBecause,
+                    evidence: a?.evidence,
+                    tags: a?.tags,
+                    confidence: a?.confidence,
+                }), true);
+            }
+
+            if (name === "recall_aether_memory") {
+                return jsonContent(await aetherMemory.recallLessons({
+                    projectRoot: a?.projectRoot,
+                    intent: a?.intent,
+                    problem: a?.problem,
+                    tags: a?.tags,
+                    limit: a?.limit,
+                }), true);
+            }
+
+            if (name === "record_aether_lesson_outcome") {
+                return jsonContent(await aetherMemory.recordLessonOutcome({
+                    projectRoot: a?.projectRoot,
+                    id: a.id,
+                    success: a.success,
+                    evidence: a?.evidence,
+                }), true);
+            }
+
+            if (name === "create_aether_skill") {
+                return jsonContent(await aetherMemory.createSkill({
+                    projectRoot: a?.projectRoot,
+                    name: a.name,
+                    description: a.description,
+                    trigger: a.trigger,
+                    procedure: a.procedure,
+                    examples: a?.examples,
+                    edgeCases: a?.edgeCases,
+                    verification: a?.verification,
+                }), true);
+            }
+
+            if (name === "list_aether_skills") {
+                return jsonContent(await aetherMemory.listSkills(a?.projectRoot), true);
+            }
+
+            if (name === "maintain_aether_skill") {
+                return jsonContent(await aetherMemory.maintainSkill({
+                    projectRoot: a?.projectRoot,
+                    name: a.name,
+                    action: a.action,
+                    reason: a.reason,
+                    patchBody: a?.patchBody,
+                    consolidateInto: a?.consolidateInto,
+                }), true);
+            }
+
+            if (name === "compact_aether_memory") {
+                return jsonContent(await aetherMemory.compact(a?.projectRoot), true);
             }
 
             if (name === "connect_browser") {
                 const mode = a?.mode || "auto";
                 const port = a?.port || 9222;
+                const browser = a?.browser || ((a?.profile || a?.profileDirectory) ? "brave" : undefined);
+
+                if (mode === "ask") {
+                    const profiles = await bridge.listBrowserProfiles("brave");
+                    const choices = [
+                        { id: "clean", label: "Aether clean browser" },
+                        ...profiles.map((p: any) => ({ id: `${p.browser}:${p.directory}`, label: `${p.name} (${p.browser})` }))
+                    ];
+
+                    const clientCapabilities = (server as any).getClientCapabilities?.();
+                    if (clientCapabilities?.elicitation) {
+                        try {
+                            const response = await (server as any).request({
+                                method: "elicitation/create",
+                                params: {
+                                    message: "Which browser should Aether control?",
+                                    requestedSchema: {
+                                        type: "object",
+                                        properties: {
+                                            choice: {
+                                                type: "string",
+                                                enum: choices.map((choice) => choice.id),
+                                                description: choices.map((choice) => `${choice.id} = ${choice.label}`).join("; ")
+                                            }
+                                        },
+                                        required: ["choice"]
+                                    }
+                                }
+                            }, z.object({
+                                action: z.string(),
+                                content: z.any().optional()
+                            }).passthrough());
+
+                            if (response.action !== "accept") {
+                                return { content: [{ type: "text", text: "Browser launch cancelled." }] };
+                            }
+
+                            const choice = response.content?.choice;
+                            if (choice === "clean") {
+                                const result = await bridge.launchBrowser({ port, headless: a?.headless });
+                                return { content: [{ type: "text", text: result }] };
+                            }
+
+                            const selected = profiles.find((p: any) => `${p.browser}:${p.directory}` === choice);
+                            if (!selected) {
+                                throw new Error(`Unknown browser choice: ${choice}`);
+                            }
+
+                            const result = await bridge.launchBrowser({
+                                browser: selected.browser,
+                                profileDirectory: selected.directory,
+                                userDataDir: selected.userDataDir,
+                                port,
+                                headless: a?.headless,
+                            });
+                            return { content: [{ type: "text", text: result }] };
+                        } catch (error) {
+                            console.error("[MCP] Elicitation failed; falling back to text choices:", error);
+                        }
+                    }
+
+                    const fallbackChoices = [
+                        `Aether clean browser: call launch_browser({ "port": ${port} })`,
+                        ...profiles.map((p: any) =>
+                            `${p.name}: call launch_browser({ "browser": "${p.browser}", "profile": "${p.name}", "port": ${port} })`
+                        )
+                    ].join("\n");
+                    return { content: [{ type: "text", text: `Available controlled browser choices:\n${fallbackChoices}` }] };
+                }
                 
                 if (mode === "connect") {
                     await bridge.sendCommand("connect", { port });
                     return { content: [{ type: "text", text: "Connected to browser successfully" }] };
                 } else if (mode === "launch") {
                     const result = await bridge.launchBrowser({ 
-                        browser: a?.browser, 
+                        browser,
                         headless: a?.headless, 
-                        port 
+                        port,
+                        profile: a?.profile,
+                        profileDirectory: a?.profileDirectory,
+                        userDataDir: a?.userDataDir,
                     });
                     return { content: [{ type: "text", text: result }] };
                 } else {
                     // auto mode - detect and launch
                     const result = await bridge.launchBrowser({ 
-                        browser: a?.browser, 
+                        browser,
                         headless: a?.headless, 
-                        port 
+                        port,
+                        profile: a?.profile,
+                        profileDirectory: a?.profileDirectory,
+                        userDataDir: a?.userDataDir,
                     });
                     return { content: [{ type: "text", text: result }] };
                 }
             }
 
             if (name === "launch_browser") {
+                const browser = a?.browser || ((a?.profile || a?.profileDirectory) ? "brave" : undefined);
                 const result = await bridge.launchBrowser({ 
-                    browser: a?.browser, 
+                    browser,
                     headless: a?.headless,
-                    port: a?.port 
+                    port: a?.port,
+                    profile: a?.profile,
+                    profileDirectory: a?.profileDirectory,
+                    userDataDir: a?.userDataDir,
                 });
                 return { content: [{ type: "text", text: result }] };
             }
@@ -614,6 +894,17 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                 }
                 const list = browsers.map((b: any) => `${b.name}: ${b.path}`).join("\n");
                 return { content: [{ type: "text", text: `Available browsers:\n${list}` }] };
+            }
+
+            if (name === "list_browser_profiles") {
+                const profiles = await bridge.listBrowserProfiles(a?.browser || "brave");
+                if (profiles.length === 0) {
+                    return { content: [{ type: "text", text: `No profiles found for ${a?.browser || "brave"}.` }] };
+                }
+                const list = profiles
+                    .map((p: any) => `${p.name}: ${p.browser}, directory=${p.directory}, userDataDir=${p.userDataDir}`)
+                    .join("\n");
+                return { content: [{ type: "text", text: `Available browser profiles:\n${list}` }] };
             }
 
             if (name === "sample_visual_frames") {
@@ -650,8 +941,7 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                 });
                 if (!result) throw new Error("Received empty state");
 
-                sessionHistory.unshift({ timestamp: new Date().toISOString(), title: result.title, url: result.url });
-                if (sessionHistory.length > MAX_MEMORY) sessionHistory.pop();
+                taskMemory.recordSession({ title: result.title, url: result.url });
 
                 const content: any[] = [
                     { type: "text", text: `Title: ${result.title}\nURL: ${result.url}` },
@@ -817,8 +1107,6 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
 
             if (name === "act") {
                 const action = a.action;
-                const taskId = `v2-${Math.random().toString(36).substring(7)}`;
-                
                 let currentState = { url: "unknown" };
                 try {
                     currentState = await bridge.sendCommand("get_state", {
@@ -830,12 +1118,7 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                     });
                 } catch {}
 
-                const node: TaskNode = {
-                    id: taskId, action, url: currentState.url, 
-                    timestamp: new Date().toISOString(), parentId: a.parentId, status: 'pending'
-                };
-                taskMemory.push(node);
-                if (taskMemory.length > MAX_MEMORY) taskMemory.shift();
+                const node = taskMemory.create(action, currentState.url, a.parentId);
 
                 let resultMsg = "";
                 const eid = a.elementId ? String(a.elementId).replace(/@/g, '') : undefined;
@@ -862,6 +1145,21 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                             if (resolved) {
                                 console.error(`[Aether] Self-healing resolved to: ${resolved.selector} (${resolved.method})`);
                                 resultMsg = await bridge.sendCommand("click_element_by_selector", { selector: resolved.selector });
+                                if (aetherMemory.canWrite(a?.projectRoot)) {
+                                    await aetherMemory.rememberLesson({
+                                        projectRoot: a?.projectRoot,
+                                        title: "Recover from brittle click selector",
+                                        trigger: "When a click fails because the exact selector or text no longer matches, but a nearby semantic element can be resolved.",
+                                        problemPattern: "A brittle click selector failed during browser automation.",
+                                        symptoms: ["click_element_by_selector threw", "selector self-healing found a replacement"],
+                                        failedApproach: a.selector || a.value || a.text || "original click target",
+                                        betterApproach: `Use resolved selector "${resolved.selector}" from ${resolved.method} after checking visible interactive candidates.`,
+                                        createdBecause: "errors_overcome",
+                                        evidence: `Recovered ${action} on ${currentState.url}. Confidence: ${resolved.confidence}.`,
+                                        tags: ["selector", "click", "self-healing"],
+                                        confidence: resolved.confidence || 0.72,
+                                    }).catch((memoryError) => console.error("[Aether] Failed to remember click recovery:", memoryError));
+                                }
                             } else {
                                 throw err;
                             }
@@ -880,6 +1178,21 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                             if (resolved) {
                                 await bridge.sendCommand("click_element_by_selector", { selector: resolved.selector });
                                 resultMsg = await bridge.sendCommand("type", { text: a.value || a.text });
+                                if (aetherMemory.canWrite(a?.projectRoot)) {
+                                    await aetherMemory.rememberLesson({
+                                        projectRoot: a?.projectRoot,
+                                        title: "Recover from brittle typing target",
+                                        trigger: "When typing fails because the original input selector no longer resolves, but a semantic replacement can be found.",
+                                        problemPattern: "A brittle typing selector failed during browser automation.",
+                                        symptoms: ["typing target could not be focused", "selector self-healing found a replacement"],
+                                        failedApproach: a.selector || "original typing target",
+                                        betterApproach: `Focus resolved selector "${resolved.selector}" from ${resolved.method}, then type with native input events.`,
+                                        createdBecause: "errors_overcome",
+                                        evidence: `Recovered ${action} on ${currentState.url}. Confidence: ${resolved.confidence}.`,
+                                        tags: ["selector", "typing", "self-healing"],
+                                        confidence: resolved.confidence || 0.72,
+                                    }).catch((memoryError) => console.error("[Aether] Failed to remember typing recovery:", memoryError));
+                                }
                             } else {
                                 throw err;
                             }
@@ -965,12 +1278,12 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
             throw new Error(`Unknown tool: ${name}`);
         } catch (error: any) {
             if (error.captcha) {
-                return { content: [{ type: "text", text: JSON.stringify(error.captcha) }], isError: true };
+                return toolError(error);
             }
             if (error.message?.includes("not connected") || error.message?.includes("No active extension")) {
-                return { content: [{ type: "text", text: `Browser not connected. Use 'connect_browser' tool first to connect or launch Chrome.` }], isError: true };
+                return toolError(error);
             }
-            return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+            return toolError(error);
         }
     });
 }

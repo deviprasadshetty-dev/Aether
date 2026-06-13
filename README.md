@@ -1,226 +1,306 @@
-# ⚡ Aether — AI Browser Controller
+# Aether - AI Browser Controller
 
-> **Let AI agents see and control your browser with native precision — no extension needed.**
+Aether is a Model Context Protocol (MCP) server that lets AI coding agents inspect and control a real browser through the Chrome DevTools Protocol (CDP). It is built for fast, accurate browser automation without requiring a browser extension.
 
-Aether is a high-performance MCP (Model Context Protocol) server that gives AI agents full browser control using the Chrome DevTools Protocol (CDP). It provides high-fidelity interactions — clicking, typing, scrolling, navigation — with a beautiful visual overlay that shows when the agent is in control.
+## What It Does
 
-**New in v2.0:** Extension-less CDP mode with auto-detection for Chrome, Edge, Brave, and Firefox.
+- Launches or connects to Chrome, Edge, Brave, or Firefox with remote debugging.
+- Exposes MCP tools for navigation, clicking, typing, form filling, screenshots, tabs, logs, cookies, network controls, PDF printing, and page inspection.
+- Uses native CDP input events instead of fragile DOM-only hacks.
+- Provides Set-of-Marks style visual element references for screenshot-based workflows.
+- Resolves elements by selector, text, role, accessible name, label, placeholder, XPath, coordinates, same-origin iframe content, and shadow DOM content.
+- Caches compact page snapshots and invalidates them on DOM/navigation/runtime events for faster repeated actions.
 
----
-
-## ✨ Features
-
-| Feature | Description |
-|---|---|
-| 🎯 **Set-of-Marks** | Interactive elements are assigned unique IDs for precise clicking |
-| 🛡️ **Self-Healing** | Fuzzy text matching + DOM re-scanning if element IDs shift |
-| 📸 **State Capture** | Screenshots, interactive elements, open tabs, and logs in one call |
-| ⌨️ **Native Input** | CDP-powered typing and clicking — not DOM hacks |
-| 🗺️ **Task Constellation** | UFO3-style hierarchical task tracking for complex flows |
-| 🤖 **Computer Use API** | Native support for Anthropic's zero-shot coordinate control |
-| ⌨️ **Special Keys** | Full support for Enter, Tab, Backspace, Arrows, and Modifiers |
-| 🔵 **Visual Overlay** | Animated blue gradient border + "Agent Controlled" badge |
-| 💫 **Click Ripples** | Blue ripple animation at click coordinates |
-| 🛡️ **Network Control** | Block ads, images, and trackers or mock specific API calls |
-| 📱 **Mobile Emulation** | Simulate iPhone/Android viewports and user agents |
-| 🧠 **Accessibility Tree** | Semantic page view for better agent understanding |
-| 🚀 **No Extension** | Direct CDP connection — no service worker issues |
-| 🌐 **Multi-Browser** | Auto-detects Chrome, Edge, Brave, Firefox |
-
----
-
-## 🏗️ Architecture
-
-### CDP Mode (Default — No Extension)
-```
-┌─────────────────────┐
-│   AI Agent (MCP)    │
-│  (Claude, etc.)     │
-└─────────┬───────────┘
-          │ stdio (JSON-RPC)
-┌─────────▼───────────┐
-│   Aether MCP Server │
-│   (Node.js + TS)    │
-└─────────┬───────────┘
-          │ CDP (direct connection)
-┌─────────▼───────────┐
-│   Browser (Chrome,  │
-│   Edge, Brave, FF)  │
-│  ┌────────────────┐ │
-│  │ CDP Protocol   │ │
-│  │ DOM + Input    │ │
-│  └────────────────┘ │
-└─────────────────────┘
-```
-
-### Extension Mode (Legacy)
-```
-┌─────────────────────┐
-│   AI Agent (MCP)    │
-│  (Claude, etc.)     │
-└─────────┬───────────┘
-          │ stdio (JSON-RPC)
-┌─────────▼───────────┐
-│   Aether MCP Server │
-│   (Node.js + TS)    │
-│   Port 3010: Health │
-└─────────┬───────────┘
-          │ WebSocket (Port 3009)
-┌─────────▼───────────┐
-│  Chrome Extension   │
-│  (Service Worker)   │
-│  ┌────────────────┐ │
-│  │ CDP Commands   │ │
-│  │ Visual Overlay │ │
-│  └────────────────┘ │
-└─── Network/Fetch ───┘
-```
-
----
-
-## 🚀 Quick Start
-
-### 1. Install & Build the Server
+## Quick Start
 
 ```bash
 cd server
 npm install
 npm run build
+node dist/index.js
 ```
 
-### 2. Configure Your MCP Client
-
-Add to your MCP client config (e.g. `claude_desktop_config.json`):
+Most MCP clients should run the built server directly:
 
 ```json
 {
   "mcpServers": {
     "aether-browser": {
       "command": "node",
-      "args": ["<path-to-project>/server/dist/index.js"]
+      "args": ["D:/brain/reddit-bot/server/dist/index.js"]
     }
   }
 }
 ```
 
-### 3. Launch a Browser (No Manual Setup Needed!)
+Replace the path with your own absolute path if the repository lives somewhere else.
 
-Aether auto-detects and launches available browsers:
+## One-Click Install
 
-```
-# In your AI agent, use these tools:
-list_browsers()                    # See available browsers
-launch_browser()                    # Auto-detect & launch
-launch_browser(browser="chrome")   # Specify browser
-launch_browser(browser="edge")      # Use Microsoft Edge
-launch_browser(browser="brave")    # Use Brave
-launch_browser(browser="firefox")   # Use Firefox
-kill_browser()                     # Kill when done
+The easiest install path is a small local script. It clones or updates Aether, installs dependencies, builds the server, and prints the MCP config entry.
+
+Windows PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/deviprasadshetty-dev/Aether---AI-Browser-Controller/main/scripts/install.ps1)))
 ```
 
-Or connect to an existing browser:
+macOS/Linux:
+
 ```bash
-# Launch browser manually with remote debugging:
-chrome --remote-debugging-port=9222
-# Then let Aether connect automatically
+curl -fsSL https://raw.githubusercontent.com/deviprasadshetty-dev/Aether---AI-Browser-Controller/main/scripts/install.sh | bash
 ```
 
----
+To also write into a specific MCP config file, pass the config path.
 
-## ❓ Why Aether vs. Generic CDP MCPs?
+Windows PowerShell:
 
-While generic CDP MCP servers exist, they are often just raw protocol wrappers. **Aether is an opinionated Agentic Driver.** We didn't just copy the protocol; we built a high-agency layer on top of it.
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/deviprasadshetty-dev/Aether---AI-Browser-Controller/main/scripts/install.ps1))) -ConfigPath "$HOME\.cursor\mcp.json"
+```
 
-| Feature | Aether | Generic CDP |
-|---|---|---|
-| 👁️ **Visual Grounding** | **Set-of-Marks (SoM)** overlay for zero-shot accuracy | Raw DOM nodes only |
-| 🎞️ **Video Understanding** | **Real-time Screencasting** with "Critical Frame" tagging | Static screenshots only |
-| 🛡️ **Self-Healing** | Fuzzy matching + DOM re-scanning on ID shifts | Fails if selector changes |
-| 🗺️ **Task Memory** | **UFO3 Task Constellation** (hierarchical graphs) | Stateless actions |
-| 🤖 **Computer Use** | Native Anthropic `computer_20241022` implementation | Not supported |
-| 🕵️ **Stealth** | Automatic `navigator.webdriver` & detection bypass | Transparent bot signature |
-| 🚀 **No Extension** | Direct CDP — no service worker issues | Often requires setup |
-| 🌐 **Multi-Browser** | Auto-detects Chrome, Edge, Brave, Firefox | Usually Chrome-only |
+macOS/Linux:
 
----
+```bash
+curl -fsSL https://raw.githubusercontent.com/deviprasadshetty-dev/Aether---AI-Browser-Controller/main/scripts/install.sh | bash -s -- --config-path "$HOME/.cursor/mcp.json"
+```
 
-## ⚡ Unique "Super-Agent" Capabilities
+Use the actual config path for Cursor, Claude Code, Codex, or KiloCode on your machine. The script preserves existing `mcpServers` entries and only adds or updates `aether-browser`.
 
-### 📽️ Real-Time Video & Screencasting
-Unlike other tools that only take static snapshots, Aether can `start_screencast` to stream frames back to the agent. More importantly, it uses **Event-Based Criticality Tagging**: it automatically flags frames that occur within 1 second of an error, click, or navigation, allowing the agent to "rewind" and understand *why* a failure happened in motion.
+### Cloudflare Workers
 
-### 🎯 Set-of-Marks (SoM) Grounding
-Aether injects a visual "Set-of-Marks" (inspired by Microsoft Research) directly into the screenshot. Every interactive element gets a numbered badge (e.g., `@12`). The agent sees the badge in the image and can click `@12` directly, bypassing the need to parse thousands of lines of volatile HTML.
+Cloudflare Workers are useful for hosting a one-click installer page or redirecting to the latest raw install script. They are not a good place to run Aether itself because Aether needs:
 
-### 🗺️ UFO3 Task Constellation
-Every action in Aether is part of a hierarchical graph. By passing a `parentId`, agents can build "Task Constellations." If a complex flow (like a multi-page checkout) fails at step 5, the agent can call `get_task_graph` to see exactly where the logic branched and recover with context.
+- stdio MCP transport to the local AI client
+- local Node.js execution
+- access to the user's local browser
+- Chrome DevTools Protocol ports
+- process launching for `launch_browser`
+- local filesystem paths for config and profile support
 
-### 🧠 Native Computer Use Support
-Aether is one of the first MCP servers to natively support the Anthropic Computer Use API schema. You can use coordinate-based mouse movements and native key-events just like a human, making it compatible with models trained for zero-shot OS control.
+A good Cloudflare Worker setup would be:
 
-### ⚡ The `act` Tool
-A unified capability for browser manipulation and inspection:
+```text
+install.aether.dev/windows  -> redirects to scripts/install.ps1
+install.aether.dev/unix     -> redirects to scripts/install.sh
+install.aether.dev          -> simple page with copy-paste commands
+```
 
-*   **Navigation**: `navigate`, `new_tab`, `switch_tab`, `close_tab`.
-*   **Interaction**: `click`, `type`, `fill`, `select`, `check`, `hover`, `scroll`, `drag_and_drop`.
-*   **Verification**: `verify_ui_state` (checks visibility/text), `assert` (built-in testing logic).
-*   **CDP Power**: `emulate_network`, `set_geolocation`, `set_timezone`, `print_pdf`.
-*   **Debugging**: `get_logs` (console + network), `get_tree` (Accessibility Tree), `get_performance_metrics`.
-*   **Advanced**: `mock_network_request`, `upload_file`, `screenshot_region`, `start_screencast`.
+See `workers/install-redirect-worker.js` for a minimal Worker that does exactly this.
 
-### 📸 The `get_state` Tool
-The primary way agents "see" the page. Returns:
-- **Screenshot**: High-quality JPEG of the active viewport.
-- **Interactive Elements**: A list of clickable/typable elements with unique IDs (e.g., `@5`).
-- **Open Tabs**: List of all browser tabs with titles and active status.
-- **Console Logs**: Recent logs and network errors for debugging.
+Deploy it with Wrangler:
 
-### 🗺️ The `get_task_graph` Tool
-Retrieves the **UFO3 Task Constellation** — a hierarchical record of every action taken in the session, allowing agents to understand their own history and recover from complex failures.
+```bash
+npx wrangler deploy
+```
 
-### 🤖 The `computer_20241022` Tool
-An implementation of Anthropic's **Computer Use API**. Allows the agent to use coordinate-based mouse moves, clicks, and drags, as well as native keyboard events (`key`, `type`).
+That gives a clean one-click distribution experience while the MCP server still runs where it must run: on the user's machine.
 
----
+## One-Prompt Install For Coding Agents
 
-## ⚡ Advanced Capabilities
+Paste one of these prompts into Cursor, Claude Code, Codex, or KiloCode from the machine where you want Aether installed. The agent should clone/build this MCP server and add it to that tool's MCP configuration.
 
-### 🛡️ Set-of-Marks & Self-Healing
-Aether assigns every interactive element a temporary ID (Set-of-Marks). If an element shifts or the ID becomes stale, Aether automatically performs fuzzy text matching and DOM re-scanning to find the element again before the agent even notices.
+### Cursor
 
-### 💉 Stealth & Bot Detection Bypass
-Aether injects stealth scripts into every page to disable `navigator.webdriver` and other common bot-detection signals. It uses native CDP events which are harder to detect than DOM-based automation.
+```text
+Install the Aether browser MCP server for Cursor.
 
-### 🌐 Network Mocking & Control
-Agents can use `mock_network_request` to intercept and replace API responses. This is invaluable for bypassing paywalls, testing edge cases, or simulating backend data without making real requests.
+1. Clone or use this repository: <AETHER_REPO_URL_OR_LOCAL_PATH>
+2. In the server directory, run npm install and npm run build.
+3. Add an MCP server named "aether-browser" to Cursor's MCP config.
+4. Use command "node" and args ["<ABSOLUTE_PATH_TO_REPO>/server/dist/index.js"].
+5. Verify the config is valid JSON and tell me the exact config file you changed.
+```
 
-### 🧠 Semantic Understanding
-By exposing the **Accessibility Tree**, Aether allows agents to see the page's structure as a collection of roles (buttons, links, headings) rather than a mess of `<div>` tags.
+### Claude Code
 
----
+```text
+Install the Aether browser MCP server for Claude Code.
 
-## 🎨 Visual Overlay
+1. Clone or use this repository: <AETHER_REPO_URL_OR_LOCAL_PATH>
+2. Run npm install and npm run build inside server.
+3. Add an MCP server named "aether-browser" that runs:
+   node <ABSOLUTE_PATH_TO_REPO>/server/dist/index.js
+4. Preserve any existing MCP servers in the config.
+5. Verify by showing the final aether-browser MCP entry.
+```
 
-When the agent controls the browser, Aether displays:
-- **Animated blue gradient border** (blue → purple → cyan)
-- **"⚡ Agent Controlled" badge** in the top-right corner
-- **Click ripple** — blue expanding circle at click coordinates
-- **Typing indicator** — visual feedback when the agent is typing
+### Codex
 
-The overlay auto-hides 3 seconds after the last command to keep the UI clean.
+```text
+Install the Aether browser MCP server for Codex.
 
----
+1. Clone or use this repository: <AETHER_REPO_URL_OR_LOCAL_PATH>
+2. Build it with:
+   cd server
+   npm install
+   npm run build
+3. Register an MCP server named "aether-browser" with command "node" and args ["<ABSOLUTE_PATH_TO_REPO>/server/dist/index.js"].
+4. Keep existing MCP configuration entries unchanged.
+5. Confirm the absolute path exists and the TypeScript build succeeds.
+```
 
-## 🔧 Smart Port Management
+### KiloCode
 
-Aether solves the "stale server" problem:
-1. On startup, checks if port 3009 is already in use.
-2. Sends an HTTP shutdown request to the existing server (`localhost:3010/shutdown`).
-3. Waits for it to exit, then starts fresh.
-4. The health endpoint is available at `http://localhost:3010/health`.
+```text
+Install the Aether browser MCP server for KiloCode.
 
----
+1. Clone or use this repository: <AETHER_REPO_URL_OR_LOCAL_PATH>
+2. Run npm install and npm run build in the server directory.
+3. Add a KiloCode MCP entry named "aether-browser".
+4. Configure it to run:
+   node <ABSOLUTE_PATH_TO_REPO>/server/dist/index.js
+5. Do not remove existing MCP servers. Report the changed config path and the final entry.
+```
 
-## 📄 License
+## Common MCP Config Entry
 
-MIT
+Use this entry if your MCP client accepts a JSON config:
+
+```json
+{
+  "aether-browser": {
+    "command": "node",
+    "args": ["<ABSOLUTE_PATH_TO_REPO>/server/dist/index.js"]
+  }
+}
+```
+
+Some clients wrap servers under `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "aether-browser": {
+      "command": "node",
+      "args": ["<ABSOLUTE_PATH_TO_REPO>/server/dist/index.js"]
+    }
+  }
+}
+```
+
+## Browser Setup
+
+Aether can launch a clean browser automatically:
+
+```text
+launch_browser()
+```
+
+You can also choose a browser:
+
+```text
+launch_browser(browser="chrome")
+launch_browser(browser="edge")
+launch_browser(browser="brave")
+```
+
+To connect to an existing browser, start it with remote debugging enabled:
+
+```bash
+chrome --remote-debugging-port=9222
+```
+
+Then call:
+
+```text
+connect_browser(mode="connect", port=9222)
+```
+
+## Useful Tools
+
+- `browser_status` - compact connection and active-tab status.
+- `snapshot_compact` - fast title, URL, readyState, and interactive element list.
+- `list_interactive_elements` - element refs for click/fill flows.
+- `click_by_ref` - click refs returned by compact snapshots.
+- `click_text`, `click_role`, `fill_label` - semantic actions powered by the locator engine.
+- `get_state` - optional screenshot, tabs, DOM snapshot, and elements.
+- `get_logs`, `get_network_errors` - compact debugging output.
+- `act` - broad compatibility action tool for older flows.
+
+## Architecture
+
+```text
+AI Agent / MCP Client
+        |
+        | stdio JSON-RPC
+        v
+Aether MCP Server
+        |
+        | Chrome DevTools Protocol
+        v
+Browser Target
+```
+
+The server is in `server/src`. The main layers are:
+
+- `index.ts` - starts the MCP server.
+- `mcp-server.ts` - registers MCP tools and routes requests.
+- `mcp-task-memory.ts` - stores task graph/session history.
+- `aether-memory-store.ts` - stores project-local learned lessons and Claude-style `SKILL.md` procedures under `.aether`.
+- `mcp-responses.ts` - formats MCP text, JSON, and error responses.
+- `cdp-bridge.ts` - maps MCP-style actions to browser operations.
+- `cdp-client.ts` - low-level CDP connection, events, and native input.
+- `locator-engine.ts` - ranked locator resolution across DOM, shadow DOM, and same-origin frames.
+- `page-snapshot-cache.ts` - cached compact snapshots with CDP invalidation hooks.
+
+## Project-Local Learning
+
+Aether can keep lightweight learning inside the project where it is being used:
+
+```text
+<project>/.aether/
+  memory/
+    lessons.jsonl
+    learned.json
+  skills/
+    <skill-name>/SKILL.md
+    _registry.json
+  memory-config.json
+```
+
+Call `configure_aether_memory` with the project root before using learning tools. Aether creates `.aether/` and adds it to `.gitignore` by default, so learned automation notes stay local unless the user deliberately shares them.
+
+The learning layer stores distilled improvements only, not raw browsing logs, screenshots, cookies, form values, or full DOM dumps.
+
+Create a lesson or skill when:
+
+- A complex task succeeded.
+- An error was overcome.
+- A user-corrected approach worked.
+- A non-trivial workflow was discovered.
+- The user asks Aether to remember a procedure.
+
+Maintain skills with:
+
+- `keep` when the skill is still valuable.
+- `patch` when instructions are outdated or broken.
+- `consolidate` when near-duplicates should become one umbrella skill.
+- `prune` when a skill is truly stale.
+
+Lessons are capped by `memory-config.json` and compacted into `memory/learned.json`, keeping the project memory small and useful as Aether gets better over time.
+
+## Development
+
+```bash
+cd server
+npm install
+npm run build
+npm run start
+```
+
+The build command runs TypeScript:
+
+```bash
+npm run build
+```
+
+## Notes
+
+- Cross-origin iframe contents are protected by browser security rules. Aether can still click by viewport coordinates when an element is visible, but semantic inspection inside cross-origin frames is limited.
+- Shadow DOM and same-origin iframe support is available through the locator engine for semantic actions and compact snapshots.
+- CAPTCHA detection is exposed as a safeguard. Be careful with automation on sites where interaction is restricted by terms of service.
+
+## License
+
+ISC

@@ -1,5 +1,7 @@
 import { getCdpClient, CdpClient } from "./cdp-client";
 import { detectAndSolve, SolverOptions } from "./captcha-solver";
+import { LocatorCandidate, LocatorEngine } from "./locator-engine";
+import { PageSnapshotCache } from "./page-snapshot-cache";
 
 /**
  * Bridge layer that translates old extension-style commands to CDP commands.
@@ -7,9 +9,13 @@ import { detectAndSolve, SolverOptions } from "./captcha-solver";
  */
 export class CdpBridge {
     private client: CdpClient;
+    private locator: LocatorEngine;
+    private snapshotCache: PageSnapshotCache;
 
     constructor() {
         this.client = getCdpClient();
+        this.locator = new LocatorEngine(this.client);
+        this.snapshotCache = new PageSnapshotCache(this.client, this.locator);
     }
 
     async ensureConnected(): Promise<void> {
@@ -24,7 +30,43 @@ export class CdpBridge {
         }
     }
 
+    private async applyCognitivePause(type: string): Promise<void> {
+        let delay = 150 + Math.random() * 250; // base delay (150-400ms)
+        if (type === "type" || type === "fill") {
+            delay += 150 + Math.random() * 250; // typing prep delay (300-650ms total)
+        } else if (type === "click") {
+            delay += 50 + Math.random() * 150; // click prep delay (200-550ms total)
+        }
+        console.error(`[Bridge] Emulating cognitive pause: ${Math.round(delay)}ms for action type: ${type}`);
+        await new Promise((r) => setTimeout(r, delay));
+    }
+
     async sendCommand(method: string, params: any = {}): Promise<any> {
+        // Cognitive pause mapping
+        const interactionTypes: Record<string, string> = {
+            click_by_ref: "click",
+            click_by_selector: "click",
+            fill_by_selector: "fill",
+            press_key: "key",
+            key_combo: "key",
+            click_text: "click",
+            click_role: "click",
+            fill_label: "fill",
+            click: "click",
+            click_element: "click",
+            click_element_by_selector: "click",
+            type: "type",
+            fill: "fill",
+            select: "click",
+            check: "click",
+            hover: "click",
+            drag_and_drop: "click"
+        };
+
+        if (interactionTypes[method]) {
+            await this.applyCognitivePause(interactionTypes[method]);
+        }
+
         switch (method) {
             case "browser_status":
                 return this.browserStatus(params);
@@ -302,30 +344,23 @@ export class CdpBridge {
     }
 
     private async snapshotCompact(params: any): Promise<any> {
-        const maxElements = Math.max(0, Math.min(Number(params.maxElements ?? 30), 100));
-        const includeText = params.includeText !== false;
-        const [title, url, readyState, elements] = await Promise.all([
-            this.client.evaluate("document.title").catch(() => "Unknown"),
-            this.client.evaluate("window.location.href").catch(() => "Unknown"),
-            this.client.evaluate("document.readyState").catch(() => "unknown"),
-            this.getCompactElements(maxElements, includeText, false).catch(() => [])
-        ]);
-
-        return {
-            title,
-            url,
-            readyState,
-            elementCount: elements.length,
-            elements
-        };
+        return this.snapshotCache.compact({
+            maxElements: params.maxElements ?? 30,
+            includeText: params.includeText !== false,
+        });
     }
 
     private async listInteractiveElements(params: any): Promise<any> {
         const maxElements = Math.max(0, Math.min(Number(params.maxElements ?? 50), 200));
-        const elements = await this.getCompactElements(maxElements, true, !!params.withOverlay);
+        const snapshot = await this.snapshotCache.compact({
+            maxElements,
+            includeText: true,
+            withOverlay: !!params.withOverlay,
+        });
         return {
-            count: elements.length,
-            elements
+            count: snapshot.elements.length,
+            cache: snapshot.cache,
+            elements: snapshot.elements
         };
     }
 
@@ -407,6 +442,16 @@ export class CdpBridge {
             return this.clickBySelector({ selector: ref.slice(4), timeout: params.timeout });
         }
 
+        if (ref.startsWith("point:")) {
+            const [x, y] = ref.slice(6).split(",").map(Number);
+            if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error(`Invalid point ref: ${ref}`);
+            const before = await this.captureActionFacts();
+            await this.client.click(x, y);
+            this.snapshotCache.invalidate("click_by_ref");
+            const after = await this.captureActionFacts();
+            return { success: true, ref, facts: this.diffActionFacts(before, after) };
+        }
+
         if (ref.startsWith("@") || ref.startsWith("som:")) {
             const id = ref.replace(/^som:/, "").replace(/^@/, "");
             await this.clickElement({ id });
@@ -424,6 +469,7 @@ export class CdpBridge {
 
         const before = await this.captureActionFacts();
         await this.clickElementBySelector({ selector });
+        this.snapshotCache.invalidate("click_by_selector");
         const after = await this.captureActionFacts(selector);
         return { success: true, selector, facts: this.diffActionFacts(before, after) };
     }
@@ -454,6 +500,7 @@ export class CdpBridge {
         if (!focused) return { success: false, selector, message: "Selector could not be focused" };
         const before = await this.captureActionFacts(selector);
         await this.client.typeText(String(value));
+        this.snapshotCache.invalidate("fill_by_selector");
         const after = await this.captureActionFacts(selector);
         return { success: true, selector, length: String(value).length, facts: this.diffActionFacts(before, after) };
     }
@@ -477,12 +524,13 @@ export class CdpBridge {
         const modifiers = Array.isArray(params.modifiers) ? params.modifiers.map(String) : [];
         const before = await this.captureActionFacts();
         await this.client.pressKey(key, modifiers);
+        this.snapshotCache.invalidate("press_key");
         const after = await this.captureActionFacts();
         return { success: true, key, modifiers, facts: this.diffActionFacts(before, after) };
     }
 
     private async clickText(params: any): Promise<any> {
-        const resolved = await this.resolveNaturalTarget({
+        const resolved = await this.locator.resolve({
             target: params.text || params.value || params.target,
             role: params.role,
             timeout: params.timeout || 5000,
@@ -490,13 +538,14 @@ export class CdpBridge {
         });
         if (!resolved.success) return resolved;
         const before = await this.captureActionFacts();
-        await this.clickElementBySelector({ selector: resolved.selector });
+        await this.clickResolvedLocator(resolved.candidate);
+        this.snapshotCache.invalidate("click_text");
         const after = await this.captureActionFacts(resolved.selector);
-        return { success: true, selector: resolved.selector, matchedBy: resolved.matchedBy, facts: this.diffActionFacts(before, after) };
+        return { success: true, selector: resolved.selector, ref: resolved.ref, matchedBy: resolved.matchedBy, confidence: resolved.confidence, facts: this.diffActionFacts(before, after) };
     }
 
     private async clickRole(params: any): Promise<any> {
-        const resolved = await this.resolveNaturalTarget({
+        const resolved = await this.locator.resolve({
             target: params.name || params.text || params.target || "",
             role: params.role,
             timeout: params.timeout || 5000,
@@ -504,20 +553,38 @@ export class CdpBridge {
         });
         if (!resolved.success) return resolved;
         const before = await this.captureActionFacts();
-        await this.clickElementBySelector({ selector: resolved.selector });
+        await this.clickResolvedLocator(resolved.candidate);
+        this.snapshotCache.invalidate("click_role");
         const after = await this.captureActionFacts(resolved.selector);
-        return { success: true, selector: resolved.selector, matchedBy: resolved.matchedBy, facts: this.diffActionFacts(before, after) };
+        return { success: true, selector: resolved.selector, ref: resolved.ref, matchedBy: resolved.matchedBy, confidence: resolved.confidence, facts: this.diffActionFacts(before, after) };
     }
 
     private async fillLabel(params: any): Promise<any> {
-        const resolved = await this.resolveNaturalTarget({
+        const resolved = await this.locator.resolve({
             target: params.label || params.target,
             role: params.role || "textbox",
             timeout: params.timeout || 5000,
             includeCandidates: params.includeCandidates
         });
         if (!resolved.success) return resolved;
-        return this.fillBySelector({ selector: resolved.selector, value: params.value ?? "", timeout: params.timeout || 5000 });
+        if (resolved.candidate?.scope === "document" && resolved.candidate.framePath.length === 0 && resolved.candidate.shadowDepth === 0) {
+            return this.fillBySelector({ selector: resolved.selector, value: params.value ?? "", timeout: params.timeout || 5000 });
+        }
+        const before = await this.captureActionFacts();
+        await this.locator.focusAndClear(resolved.candidate!);
+        await this.client.typeText(String(params.value ?? ""));
+        this.snapshotCache.invalidate("fill_label");
+        const after = await this.captureActionFacts();
+        return { success: true, selector: resolved.selector, ref: resolved.ref, matchedBy: resolved.matchedBy, confidence: resolved.confidence, length: String(params.value ?? "").length, facts: this.diffActionFacts(before, after) };
+    }
+
+    private async clickResolvedLocator(candidate?: LocatorCandidate): Promise<void> {
+        if (!candidate) throw new Error("Resolved locator missing candidate details");
+        if (candidate.scope === "document" && candidate.framePath.length === 0 && candidate.shadowDepth === 0 && candidate.selector) {
+            await this.clickElementBySelector({ selector: candidate.selector });
+            return;
+        }
+        await this.locator.click(candidate);
     }
 
     private async elementAtPoint(params: any): Promise<any> {
@@ -713,7 +780,7 @@ export class CdpBridge {
             return this.intentResult(result.success, intent, undefined, result);
         }
 
-        const resolved = await this.resolveNaturalTarget({
+        const resolved = await this.locator.resolve({
             target: params.target,
             role: params.role,
             timeout,
@@ -730,9 +797,14 @@ export class CdpBridge {
         const selector = resolved.selector;
 
         if (intent === "click") {
-            await this.clickElementBySelector({ selector });
+            await this.clickResolvedLocator(resolved.candidate);
         } else if (intent === "fill") {
-            await this.fillBySelector({ selector, value: params.value ?? "", timeout });
+            if (resolved.candidate?.scope === "document" && resolved.candidate.framePath.length === 0 && resolved.candidate.shadowDepth === 0) {
+                await this.fillBySelector({ selector, value: params.value ?? "", timeout });
+            } else {
+                await this.locator.focusAndClear(resolved.candidate!);
+                await this.client.typeText(String(params.value ?? ""));
+            }
         } else if (intent === "select") {
             await this.selectOption({ selector, value: params.value ?? "" });
         } else if (intent === "check") {
@@ -740,6 +812,7 @@ export class CdpBridge {
         } else {
             throw new Error(`Unsupported browser intent: ${intent}`);
         }
+        this.snapshotCache.invalidate(`browser_intent:${intent}`);
 
         let verification: any = undefined;
         if (params.verify) {
@@ -751,7 +824,7 @@ export class CdpBridge {
 
         return this.intentResult(true, intent, resolved, {
             selector,
-            ref: `css:${selector}`,
+            ref: resolved.ref || (selector ? `css:${selector}` : undefined),
             verification,
             candidates: params.includeCandidates ? resolved.candidates : undefined
         });
@@ -997,28 +1070,35 @@ export class CdpBridge {
         const includeSoM = params.som === true || params.withOverlay === true;
         const includeTabs = params.tabs === true;
 
-        const [title, url, screenshot, domSnapshot, elements, tabs] = await Promise.all([
-            this.client.evaluate("document.title").catch(() => "Unknown"),
-            this.client.evaluate("window.location.href").catch(() => "Unknown"),
+        const compact = includeElements
+            ? await this.snapshotCache.compact({ maxElements: 200, includeText: true, withOverlay: includeSoM })
+            : await this.snapshotCache.compact({ maxElements: 0, includeText: false });
+
+        const [screenshot, domSnapshot, tabs] = await Promise.all([
             includeScreenshot ? this.client.screenshot(params.format, params.quality).catch(() => null) : Promise.resolve(null),
             includeDomSnapshot ? this.client.getDOMSnapshot().catch(() => null) : Promise.resolve(null),
-            includeElements ? this.client.getInteractiveElements(includeSoM).catch(() => ({ elements: [], somInjected: false })) : Promise.resolve({ elements: [], somInjected: false }),
             includeTabs ? this.client.getTabs().catch(() => []) : Promise.resolve([]),
         ]);
 
+        if (includeSoM) {
+            await this.client.removeSoMOverlay().catch(() => {});
+        }
+
         return {
-            title,
-            url,
+            title: compact.title,
+            url: compact.url,
             screenshot,
             domSnapshot,
-            elements: elements.elements,
-            somInjected: elements.somInjected,
+            elements: includeElements ? compact.elements : [],
+            somInjected: includeSoM,
+            cache: compact.cache,
             tabs,
         };
     }
 
     private async navigate(params: any): Promise<string> {
         await this.client.navigateAndWait(params.url, params.timeout || 10000);
+        this.snapshotCache.invalidate("navigate");
         return "Navigated";
     }
 
@@ -1034,6 +1114,7 @@ export class CdpBridge {
         const x = params.x || params.coordinate?.split(',')[0] || 100;
         const y = params.y || params.coordinate?.split(',')[1] || 100;
         await this.client.click(x, y);
+        this.snapshotCache.invalidate("click");
         return "Clicked";
     }
 
@@ -1060,14 +1141,15 @@ export class CdpBridge {
                     if (el) {
                         el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
                         const rect = el.getBoundingClientRect();
-                        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+                        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, w: rect.width };
                     }
                     return null;
                 })()
             `);
             
             if (result) {
-                await this.client.click(result.x, result.y, params.button);
+                await this.client.click(result.x, result.y, params.button, result.w);
+                this.snapshotCache.invalidate("click_element");
                 return `Clicked element @${params.id}`;
             }
             
@@ -1083,6 +1165,7 @@ export class CdpBridge {
         // Fallback to coordinate click
         if (params.x !== undefined && params.y !== undefined) {
             await this.client.click(params.x, params.y);
+            this.snapshotCache.invalidate("click_element");
             return "Clicked at coordinates";
         }
         
@@ -1090,21 +1173,10 @@ export class CdpBridge {
     }
 
     private async clickElementByText(params: any): Promise<string> {
-        const result = await this.client.evaluate(`
-            (function() {
-                const text = ${JSON.stringify(params.text)};
-                const elements = Array.from(document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick]'));
-                const el = elements.find(e => (e.innerText || e.textContent || '').includes(text));
-                if (el) {
-                    const rect = el.getBoundingClientRect();
-                    return { x: rect.left + rect.width/2, y: rect.top + rect.height/2 };
-                }
-                return null;
-            })()
-        `);
-        
-        if (result) {
-            await this.client.click(result.x, result.y);
+        const result = await this.locator.resolve({ target: params.text, timeout: params.timeout || 5000 });
+        if (result.success && result.candidate) {
+            await this.clickResolvedLocator(result.candidate);
+            this.snapshotCache.invalidate("click_element_by_text");
             return `Clicked element with text: ${params.text}`;
         }
         throw new Error(`Element with text not found: ${params.text}`);
@@ -1113,6 +1185,13 @@ export class CdpBridge {
     private async clickElementBySelector(params: any): Promise<string> {
         const selector = params.selector;
         if (!selector) throw new Error("Selector required");
+        if (String(selector).startsWith("point:")) {
+            const [x, y] = String(selector).slice(6).split(",").map(Number);
+            if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error(`Invalid point selector: ${selector}`);
+            await this.client.click(x, y);
+            this.snapshotCache.invalidate("click_element_by_selector");
+            return "Clicked element by point";
+        }
 
         // Get element bounds via CDP
         const result = await this.client.sendCommand("Runtime.evaluate", {
@@ -1124,15 +1203,16 @@ export class CdpBridge {
                     const rect = el.getBoundingClientRect();
                     const computed = window.getComputedStyle(el);
                     if (computed.display === 'none' || computed.visibility === 'hidden' || rect.width === 0 || rect.height === 0) return null;
-                    return { x: rect.left + rect.width/2, y: rect.top + rect.height/2 };
+                    return { x: rect.left + rect.width/2, y: rect.top + rect.height/2, w: rect.width };
                 })()
             `,
             returnByValue: true,
         });
 
         if (result.result?.value) {
-            const { x, y } = result.result.value;
-            await this.client.click(x, y, params.button);
+            const { x, y, w } = result.result.value;
+            await this.client.click(x, y, params.button, w);
+            this.snapshotCache.invalidate("click_element_by_selector");
             return "Clicked element by selector";
         }
         throw new Error(`Element not found: ${selector}`);
@@ -1556,6 +1636,22 @@ export class CdpBridge {
             if (exists) {
                 return { selector: originalSelector, method: "exact", confidence: 1.0 };
             }
+        }
+
+        const resolved = await this.locator.resolve({
+            target: text,
+            timeout: params.timeout || 1500,
+            includeCandidates: false,
+        }).catch(() => null);
+
+        if (resolved?.success && (resolved.selector || resolved.ref)) {
+            return {
+                selector: resolved.candidate?.scope === "document" && resolved.candidate.framePath.length === 0 && resolved.candidate.shadowDepth === 0
+                    ? resolved.selector || ""
+                    : resolved.ref || "",
+                method: resolved.matchedBy || "locator",
+                confidence: resolved.confidence || 0.7,
+            };
         }
         
         // Try fuzzy text matching if enabled
@@ -2335,14 +2431,23 @@ export class CdpBridge {
         browser?: 'chrome' | 'edge' | 'brave' | 'firefox';
         headless?: boolean;
         port?: number;
+        profile?: string;
+        profileDirectory?: string;
+        userDataDir?: string;
     }): Promise<string> {
         const client = getCdpClient();
         await client.launchAuto({
             browser: options?.browser,
             headless: options?.headless,
             port: options?.port,
+            profile: options?.profile,
+            profileDirectory: options?.profileDirectory,
+            userDataDir: options?.userDataDir,
         });
-        return "Browser launched successfully";
+        const profileLabel = options?.profile || options?.profileDirectory;
+        return profileLabel
+            ? `Browser launched successfully with profile "${profileLabel}"`
+            : "Browser launched successfully";
     }
 
     async killBrowser(): Promise<string> {
@@ -2354,6 +2459,11 @@ export class CdpBridge {
     async listBrowsers(): Promise<any> {
         const client = getCdpClient();
         return await client.listAvailableBrowsers();
+    }
+
+    async listBrowserProfiles(browser?: 'chrome' | 'edge' | 'brave'): Promise<any> {
+        const client = getCdpClient();
+        return await client.listBrowserProfiles(browser || "brave");
     }
 
     private async getTargetsViaHttp(): Promise<any[]> {
