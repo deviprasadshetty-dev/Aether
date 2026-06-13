@@ -2,6 +2,8 @@ import { getCdpClient, CdpClient } from "./cdp-client";
 import { detectAndSolve, SolverOptions } from "./captcha-solver";
 import { LocatorCandidate, LocatorEngine } from "./locator-engine";
 import { PageSnapshotCache } from "./page-snapshot-cache";
+import { promises as fs } from "fs";
+import path from "path";
 
 /**
  * Bridge layer that translates old extension-style commands to CDP commands.
@@ -170,6 +172,15 @@ export class CdpBridge {
             case "get_dom_snapshot":
                 await this.ensureConnected();
                 return this.getDomSnapshot(params);
+            case "get_page_text":
+                await this.ensureConnected();
+                return this.getPageText(params);
+            case "save_auth_state":
+                await this.ensureConnected();
+                return this.saveAuthState(params);
+            case "load_auth_state":
+                await this.ensureConnected();
+                return this.loadAuthState(params);
             case "get_tabs":
                 await this.ensureConnected();
                 return this.getTabs(params);
@@ -362,76 +373,6 @@ export class CdpBridge {
             cache: snapshot.cache,
             elements: snapshot.elements
         };
-    }
-
-    private async getCompactElements(maxElements: number, includeText: boolean, withOverlay: boolean): Promise<any[]> {
-        const result = await this.client.sendCommand("Runtime.evaluate", {
-            expression: `
-                (function() {
-                    const max = ${JSON.stringify(maxElements)};
-                    const includeText = ${JSON.stringify(includeText)};
-                    const selectors = [
-                        'a[href]', 'button', 'input:not([type="hidden"])', 'select', 'textarea',
-                        '[onclick]', '[role="button"]', '[role="link"]', '[role="checkbox"]',
-                        '[tabindex]:not([tabindex="-1"])', 'label', 'summary'
-                    ].join(', ');
-
-                    function cssPath(el) {
-                        if (el.id) return '#' + CSS.escape(el.id);
-                        const path = [];
-                        while (el && el.nodeType === Node.ELEMENT_NODE && el !== document.body) {
-                            let selector = el.nodeName.toLowerCase();
-                            if (el.classList && el.classList.length) {
-                                selector += '.' + Array.from(el.classList).slice(0, 2).map(c => CSS.escape(c)).join('.');
-                            }
-                            const parent = el.parentElement;
-                            if (parent) {
-                                const siblings = Array.from(parent.children).filter(child => child.nodeName === el.nodeName);
-                                if (siblings.length > 1) selector += ':nth-of-type(' + (siblings.indexOf(el) + 1) + ')';
-                            }
-                            path.unshift(selector);
-                            el = parent;
-                        }
-                        return path.length ? path.join(' > ') : '';
-                    }
-
-                    return Array.from(document.querySelectorAll(selectors)).map((el, index) => {
-                        const rect = el.getBoundingClientRect();
-                        const computed = window.getComputedStyle(el);
-                        const visible = computed.display !== 'none' && computed.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-                        if (!visible) return null;
-                        const selector = cssPath(el);
-                        if (!selector) return null;
-                        const text = ((el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '') + '').trim().replace(/\\s+/g, ' ').substring(0, 120);
-                        return {
-                            ref: 'css:' + selector,
-                            index: index + 1,
-                            tag: el.tagName.toLowerCase(),
-                            role: el.getAttribute('role') || '',
-                            type: el.getAttribute('type') || '',
-                            name: el.getAttribute('name') || '',
-                            text: includeText ? text : undefined,
-                            bounds: {
-                                x: Math.round(rect.left),
-                                y: Math.round(rect.top),
-                                width: Math.round(rect.width),
-                                height: Math.round(rect.height)
-                            }
-                        };
-                    }).filter(Boolean).slice(0, max);
-                })()
-            `,
-            returnByValue: true,
-            awaitPromise: true
-        });
-
-        const elements = result.result?.value || [];
-
-        if (withOverlay && elements.length > 0) {
-            await this.client.getInteractiveElements(true).catch(() => ({ elements: [], somInjected: false }));
-        }
-
-        return elements;
     }
 
     private async clickByRef(params: any): Promise<any> {
@@ -1193,29 +1134,99 @@ export class CdpBridge {
             return "Clicked element by point";
         }
 
-        // Get element bounds via CDP
-        const result = await this.client.sendCommand("Runtime.evaluate", {
-            expression: `
-                (function() {
-                    const el = document.querySelector(${JSON.stringify(selector)});
-                    if (!el) return null;
-                    el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-                    const rect = el.getBoundingClientRect();
-                    const computed = window.getComputedStyle(el);
-                    if (computed.display === 'none' || computed.visibility === 'hidden' || rect.width === 0 || rect.height === 0) return null;
-                    return { x: rect.left + rect.width/2, y: rect.top + rect.height/2, w: rect.width };
-                })()
-            `,
-            returnByValue: true,
-        });
-
-        if (result.result?.value) {
-            const { x, y, w } = result.result.value;
-            await this.client.click(x, y, params.button, w);
-            this.snapshotCache.invalidate("click_element_by_selector");
-            return "Clicked element by selector";
+        // Run the full actionability gate (visible, enabled, in-viewport, stable
+        // bounds, not obscured) before committing the click.
+        const point = await this.resolveActionablePoint(selector, params.timeout ?? 4000);
+        if (!point.ok) {
+            const detail = point.reason === "obscured" && point.obscuredBy
+                ? `${point.reason} by <${point.obscuredBy}>`
+                : point.reason;
+            throw new Error(`Element not actionable (${detail}): ${selector}`);
         }
-        throw new Error(`Element not found: ${selector}`);
+
+        await this.client.click(point.x!, point.y!, params.button, point.w);
+        this.snapshotCache.invalidate("click_element_by_selector");
+        return "Clicked element by selector";
+    }
+
+    /**
+     * Centralized actionability gate. Polls until the selector resolves to an
+     * element that is visible, enabled, scrolled into the viewport, has stable
+     * bounds across frames, and is the topmost element at its own click point
+     * (i.e. not covered by an overlay/cookie banner). Returns the verified click
+     * point, or the blocking reason so the caller can surface it.
+     */
+    private async resolveActionablePoint(
+        selector: string,
+        timeout: number = 4000
+    ): Promise<{ ok: boolean; reason: string; x?: number; y?: number; w?: number; obscuredBy?: string }> {
+        const start = Date.now();
+        let lastBoxKey = "";
+        let stableHits = 0;
+        let last: any = { ok: false, reason: "not_found" };
+
+        while (Date.now() - start < timeout) {
+            const result = await this.client.sendCommand("Runtime.evaluate", {
+                expression: `
+                    (function() {
+                        const el = document.querySelector(${JSON.stringify(selector)});
+                        if (!el) return { ok: false, reason: 'not_found' };
+                        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0' || rect.width === 0 || rect.height === 0) {
+                            return { ok: false, reason: 'not_visible' };
+                        }
+                        if (el.disabled === true || el.getAttribute('aria-disabled') === 'true' || style.pointerEvents === 'none') {
+                            return { ok: false, reason: 'disabled' };
+                        }
+                        const cx = rect.left + rect.width / 2;
+                        const cy = rect.top + rect.height / 2;
+                        const vw = window.innerWidth || document.documentElement.clientWidth;
+                        const vh = window.innerHeight || document.documentElement.clientHeight;
+                        if (cx < 0 || cy < 0 || cx > vw || cy > vh) {
+                            return { ok: false, reason: 'offscreen' };
+                        }
+                        const top = document.elementFromPoint(cx, cy);
+                        const reachable = top === el || el.contains(top) || (top && top.contains(el));
+                        let obscuredBy = '';
+                        if (!reachable && top) {
+                            obscuredBy = top.tagName.toLowerCase() + (top.id ? '#' + top.id : '');
+                        }
+                        return {
+                            ok: !!reachable,
+                            reason: reachable ? 'ok' : 'obscured',
+                            obscuredBy: obscuredBy,
+                            x: cx,
+                            y: cy,
+                            w: rect.width,
+                            boxKey: Math.round(rect.left) + ',' + Math.round(rect.top) + ',' + Math.round(rect.width) + ',' + Math.round(rect.height)
+                        };
+                    })()
+                `,
+                returnByValue: true,
+            });
+
+            const state = result.result?.value;
+            if (state) {
+                last = state;
+                if (state.ok) {
+                    if (state.boxKey === lastBoxKey) {
+                        stableHits++;
+                        if (stableHits >= 1) {
+                            return { ok: true, reason: "ok", x: state.x, y: state.y, w: state.w };
+                        }
+                    } else {
+                        lastBoxKey = state.boxKey;
+                        stableHits = 0;
+                    }
+                }
+            }
+
+            await new Promise(r => setTimeout(r, 90));
+        }
+
+        return { ok: false, reason: last?.reason || "timeout", obscuredBy: last?.obscuredBy };
     }
 
     private async type(params: any): Promise<string> {
@@ -1272,6 +1283,274 @@ export class CdpBridge {
 
     private async getDomSnapshot(params: any): Promise<any> {
         return await this.client.getDOMSnapshot();
+    }
+
+    /**
+     * Extract clean, readable page content as Markdown (or plain text) — a
+     * token-cheap alternative to screenshots or full DOM dumps for reading a page.
+     * Scopes to `selector` when provided, otherwise picks the main content region.
+     */
+    private async getPageText(params: any): Promise<any> {
+        const format = params.format === "text" ? "text" : "markdown";
+        const selector = params.selector ? String(params.selector) : "";
+        const maxLength = Math.max(500, Math.min(Number(params.maxLength ?? 20000), 200000));
+        const includeLinks = params.includeLinks !== false;
+
+        const extracted = await this.client.evaluate(`
+            (function() {
+                const FORMAT = ${JSON.stringify(format)};
+                const SELECTOR = ${JSON.stringify(selector)};
+                const INCLUDE_LINKS = ${JSON.stringify(includeLinks)};
+                const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','CANVAS','TEMPLATE','IFRAME','OBJECT','EMBED','NAV','FOOTER','HEADER','ASIDE']);
+
+                function pickRoot() {
+                    if (SELECTOR) {
+                        const el = document.querySelector(SELECTOR);
+                        if (el) return el;
+                    }
+                    return document.querySelector('main, article, [role="main"]') || document.body || document.documentElement;
+                }
+
+                function isHidden(el) {
+                    if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') return true;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return true;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width === 0 && rect.height === 0 && el.tagName !== 'BR' && el.tagName !== 'HR';
+                }
+
+                function inline(node) {
+                    let out = '';
+                    node.childNodes.forEach(function(child) {
+                        if (child.nodeType === Node.TEXT_NODE) {
+                            out += child.textContent.replace(/\\s+/g, ' ');
+                        } else if (child.nodeType === Node.ELEMENT_NODE) {
+                            if (SKIP.has(child.tagName) || isHidden(child)) return;
+                            const tag = child.tagName.toLowerCase();
+                            const inner = inline(child);
+                            if (FORMAT === 'markdown') {
+                                if (tag === 'a' && INCLUDE_LINKS && child.getAttribute('href')) {
+                                    const href = child.getAttribute('href');
+                                    out += inner.trim() ? '[' + inner.trim() + '](' + href + ')' : '';
+                                } else if (tag === 'strong' || tag === 'b') {
+                                    out += inner.trim() ? '**' + inner.trim() + '**' : '';
+                                } else if (tag === 'em' || tag === 'i') {
+                                    out += inner.trim() ? '*' + inner.trim() + '*' : '';
+                                } else if (tag === 'code') {
+                                    out += inner.trim() ? '\`' + inner.trim() + '\`' : '';
+                                } else if (tag === 'br') {
+                                    out += '\\n';
+                                } else {
+                                    out += inner;
+                                }
+                            } else {
+                                out += (tag === 'br') ? '\\n' : inner;
+                            }
+                        }
+                    });
+                    return out;
+                }
+
+                const BLOCK = new Set(['P','DIV','SECTION','ARTICLE','UL','OL','LI','TABLE','TR','BLOCKQUOTE','PRE','H1','H2','H3','H4','H5','H6','HR','FIGURE','FIGCAPTION']);
+                const lines = [];
+
+                function walk(node, depth) {
+                    if (node.nodeType !== Node.ELEMENT_NODE) return;
+                    if (SKIP.has(node.tagName) || isHidden(node)) return;
+                    const tag = node.tagName.toLowerCase();
+
+                    if (/^h[1-6]$/.test(tag)) {
+                        const t = inline(node).trim();
+                        if (t) lines.push(FORMAT === 'markdown' ? '#'.repeat(Number(tag[1])) + ' ' + t : t);
+                        return;
+                    }
+                    if (tag === 'hr') { lines.push(FORMAT === 'markdown' ? '---' : ''); return; }
+                    if (tag === 'pre') {
+                        const t = (node.innerText || node.textContent || '').replace(/\\s+$/,'');
+                        if (t) lines.push(FORMAT === 'markdown' ? '\\n\`\`\`\\n' + t + '\\n\`\`\`\\n' : t);
+                        return;
+                    }
+                    if (tag === 'li') {
+                        const t = inline(node).trim();
+                        if (t) {
+                            const indent = '  '.repeat(Math.max(0, depth));
+                            lines.push(FORMAT === 'markdown' ? indent + '- ' + t : indent + '• ' + t);
+                        }
+                        return;
+                    }
+                    if (tag === 'blockquote') {
+                        const t = inline(node).trim();
+                        if (t) lines.push(FORMAT === 'markdown' ? '> ' + t : t);
+                        return;
+                    }
+                    if (tag === 'tr') {
+                        const cells = Array.from(node.children).map(function(c){ return inline(c).trim(); });
+                        if (cells.some(Boolean)) lines.push(FORMAT === 'markdown' ? '| ' + cells.join(' | ') + ' |' : cells.join('\\t'));
+                        return;
+                    }
+
+                    // Leaf-ish block (no block descendants): emit its inline text once.
+                    const hasBlockChild = Array.from(node.children).some(function(c){ return BLOCK.has(c.tagName); });
+                    if (!hasBlockChild && (tag === 'p' || tag === 'div' || tag === 'section' || tag === 'figcaption' || tag === 'td' || tag === 'th')) {
+                        const t = inline(node).trim();
+                        if (t) lines.push(t);
+                        return;
+                    }
+
+                    const nextDepth = (tag === 'ul' || tag === 'ol') ? depth + 1 : depth;
+                    node.childNodes.forEach(function(child){ walk(child, nextDepth); });
+                }
+
+                const root = pickRoot();
+                walk(root, 0);
+
+                let text = lines.join('\\n\\n').replace(/\\n{3,}/g, '\\n\\n').replace(/[ \\t]+\\n/g, '\\n').trim();
+                return { title: document.title || '', url: location.href, text: text };
+            })()
+        `).catch((e: any) => ({ title: "", url: "", text: "", error: e?.message }));
+
+        const text = String(extracted?.text ?? "");
+        const truncated = text.length > maxLength;
+        return {
+            title: extracted?.title ?? "",
+            url: extracted?.url ?? "",
+            format,
+            length: text.length,
+            truncated,
+            text: truncated ? text.slice(0, maxLength) + "\n\n…[truncated]" : text,
+        };
+    }
+
+    private defaultAuthStatePath(custom?: string): string {
+        if (custom) return path.resolve(String(custom));
+        return path.resolve(process.cwd(), ".aether", "auth-state.json");
+    }
+
+    // CDP Network.getAllCookies returns Cookie objects with read-only fields
+    // (size, session, …) that Network.setCookies rejects. Keep only CookieParam fields.
+    private toCookieParam(c: any): any {
+        const param: any = {
+            name: c.name,
+            value: c.value,
+            domain: c.domain,
+            path: c.path,
+            secure: c.secure,
+            httpOnly: c.httpOnly,
+        };
+        if (typeof c.expires === "number" && c.expires > 0) param.expires = c.expires;
+        if (c.sameSite) param.sameSite = c.sameSite;
+        if (c.priority) param.priority = c.priority;
+        if (c.sourceScheme) param.sourceScheme = c.sourceScheme;
+        if (typeof c.sourcePort === "number") param.sourcePort = c.sourcePort;
+        if (c.partitionKey) param.partitionKey = c.partitionKey;
+        return param;
+    }
+
+    /**
+     * Export the current session (cookies + localStorage + sessionStorage of the
+     * active origin) to a JSON file so a logged-in state can be reused later.
+     */
+    private async saveAuthState(params: any): Promise<any> {
+        const filePath = this.defaultAuthStatePath(params.path);
+
+        const cookiesRes = await this.client.sendCommand("Network.getAllCookies", {})
+            .catch(() => this.client.sendCommand("Storage.getCookies", {}).catch(() => ({ cookies: [] })));
+        const cookies = (cookiesRes?.cookies || []).map((c: any) => this.toCookieParam(c));
+
+        const storage = await this.client.evaluate(`
+            (function() {
+                const ls = {}, ss = {};
+                try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); ls[k] = localStorage.getItem(k); } } catch (e) {}
+                try { for (let i = 0; i < sessionStorage.length; i++) { const k = sessionStorage.key(i); ss[k] = sessionStorage.getItem(k); } } catch (e) {}
+                return { origin: location.origin, localStorage: ls, sessionStorage: ss };
+            })()
+        `).catch(() => null);
+
+        const state = {
+            version: 1,
+            savedAt: new Date().toISOString(),
+            cookies,
+            origins: storage ? [storage] : [],
+        };
+
+        await fs.mkdir(path.dirname(filePath), { recursive: true });
+        await fs.writeFile(filePath, JSON.stringify(state, null, 2), "utf8");
+
+        return {
+            success: true,
+            path: filePath,
+            cookies: cookies.length,
+            origins: state.origins.length,
+            storageKeys: storage ? Object.keys(storage.localStorage).length + Object.keys(storage.sessionStorage).length : 0,
+        };
+    }
+
+    /**
+     * Restore a session saved by saveAuthState. Cookies are set globally; storage
+     * is restored for the active origin (navigate to the site first), then the tab
+     * is reloaded so the session takes effect.
+     */
+    private async loadAuthState(params: any): Promise<any> {
+        const filePath = this.defaultAuthStatePath(params.path);
+
+        let raw: string;
+        try {
+            raw = await fs.readFile(filePath, "utf8");
+        } catch (e: any) {
+            return { success: false, path: filePath, message: `Could not read auth state: ${e?.message}` };
+        }
+
+        let state: any;
+        try {
+            state = JSON.parse(raw);
+        } catch (e: any) {
+            return { success: false, path: filePath, message: `Invalid auth state JSON: ${e?.message}` };
+        }
+
+        let cookiesSet = 0;
+        if (Array.isArray(state.cookies) && state.cookies.length) {
+            const params2 = state.cookies.map((c: any) => this.toCookieParam(c));
+            await this.client.setCookies(params2).catch((err: any) => {
+                console.error("[Aether] setCookies failed during loadAuthState:", err?.message);
+            });
+            cookiesSet = params2.length;
+        }
+
+        let storageRestored = 0;
+        let storageSkipped = 0;
+        const currentOrigin = await this.client.evaluate("location.origin").catch(() => "");
+        for (const entry of (state.origins || [])) {
+            if (entry.origin && currentOrigin && entry.origin !== currentOrigin) {
+                storageSkipped++;
+                continue;
+            }
+            const data = JSON.stringify({ localStorage: entry.localStorage || {}, sessionStorage: entry.sessionStorage || {} });
+            const ok = await this.client.evaluate(`
+                (function() {
+                    try {
+                        const data = ${data};
+                        for (const k in data.localStorage) localStorage.setItem(k, data.localStorage[k]);
+                        for (const k in data.sessionStorage) sessionStorage.setItem(k, data.sessionStorage[k]);
+                        return true;
+                    } catch (e) { return false; }
+                })()
+            `).catch(() => false);
+            if (ok) storageRestored++;
+        }
+
+        if (params.reload !== false) {
+            await this.client.reload(false).catch(() => {});
+        }
+        this.snapshotCache.invalidate("load_auth_state");
+
+        return {
+            success: true,
+            path: filePath,
+            cookiesSet,
+            storageRestored,
+            storageSkipped,
+            note: storageSkipped > 0 ? "Some storage origins were skipped; navigate to that origin before loading to restore them." : undefined,
+        };
     }
 
     // ==================== AGENT-CENTRIC APIs ====================

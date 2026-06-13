@@ -1,4 +1,5 @@
 import { CdpClient } from "./cdp-client";
+import { SHARED_DOM_HELPERS } from "./element-collector";
 
 export interface LocatorCandidate {
     ref: string;
@@ -156,40 +157,16 @@ function locatorScript(input: {
                 '[contenteditable="true"]', '[aria-label]', '[placeholder]'
             ].join(', ');
 
-            function norm(value) {
-                return String(value || '').trim().replace(/\\s+/g, ' ');
-            }
+            ${SHARED_DOM_HELPERS}
 
-            function visible(el) {
-                const rect = el.getBoundingClientRect();
-                const style = window.getComputedStyle(el);
-                return style.display !== 'none' &&
-                    style.visibility !== 'hidden' &&
-                    style.opacity !== '0' &&
-                    rect.width > 0 &&
-                    rect.height > 0;
-            }
-
-            function cssPath(el) {
-                if (!el || el.nodeType !== Node.ELEMENT_NODE) return '';
-                if (el.id) return '#' + CSS.escape(el.id);
-                const path = [];
-                let node = el;
-                while (node && node.nodeType === Node.ELEMENT_NODE && node !== node.ownerDocument.body) {
-                    let part = node.nodeName.toLowerCase();
-                    if (node.classList && node.classList.length) {
-                        part += '.' + Array.from(node.classList).slice(0, 2).map((c) => CSS.escape(c)).join('.');
-                    }
-                    const parent = node.parentElement;
-                    if (parent) {
-                        const same = Array.from(parent.children).filter((child) => child.nodeName === node.nodeName);
-                        if (same.length > 1) part += ':nth-of-type(' + (same.indexOf(node) + 1) + ')';
-                    }
-                    path.unshift(part);
-                    node = parent;
-                }
-                return path.join(' > ');
-            }
+            // Thin aliases so the rest of this resolver reads naturally while the
+            // implementations stay shared with every other collector.
+            const norm = aetherNorm;
+            const visible = aetherVisible;
+            const cssPath = aetherStableSelector;
+            const inferRole = aetherImplicitRole;
+            const labelFor = aetherLabelFor;
+            const textFor = aetherAccessibleName;
 
             function xpath(el) {
                 const parts = [];
@@ -205,55 +182,6 @@ function locatorScript(input: {
                     node = node.parentElement;
                 }
                 return '/' + parts.join('/');
-            }
-
-            function inferRole(el) {
-                const explicit = (el.getAttribute('role') || '').toLowerCase();
-                if (explicit) return explicit;
-                const tag = el.tagName.toLowerCase();
-                const type = (el.getAttribute('type') || '').toLowerCase();
-                if (tag === 'button' || type === 'button' || type === 'submit' || type === 'reset') return 'button';
-                if (tag === 'a') return 'link';
-                if (tag === 'textarea') return 'textbox';
-                if (tag === 'select') return 'combobox';
-                if (tag === 'input' && ['checkbox', 'radio'].includes(type)) return type;
-                if (tag === 'input') return 'textbox';
-                if (el.isContentEditable) return 'textbox';
-                if (tag === 'summary') return 'button';
-                return tag;
-            }
-
-            function byId(doc, id) {
-                if (!id) return '';
-                const el = doc.getElementById(id);
-                return el ? norm(el.innerText || el.textContent) : '';
-            }
-
-            function labelFor(el) {
-                const doc = el.ownerDocument;
-                const labelledBy = norm((el.getAttribute('aria-labelledby') || '').split(/\\s+/).map((id) => byId(doc, id)).join(' '));
-                if (labelledBy) return labelledBy;
-                if (el.id) {
-                    const direct = doc.querySelector('label[for="' + CSS.escape(el.id) + '"]');
-                    if (direct) return norm(direct.innerText || direct.textContent);
-                }
-                const wrapping = el.closest && el.closest('label');
-                return wrapping ? norm(wrapping.innerText || wrapping.textContent) : '';
-            }
-
-            function textFor(el) {
-                return norm(
-                    el.getAttribute('aria-label') ||
-                    labelFor(el) ||
-                    el.getAttribute('placeholder') ||
-                    el.getAttribute('alt') ||
-                    el.getAttribute('title') ||
-                    el.innerText ||
-                    el.textContent ||
-                    el.getAttribute('value') ||
-                    el.getAttribute('name') ||
-                    ''
-                );
             }
 
             function scoreField(field, value, exact, includes) {

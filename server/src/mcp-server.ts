@@ -670,6 +670,41 @@ const Tools = [
         }
     },
     {
+        name: "get_page_text",
+        description: "READ TOOL. Extract clean, readable page content as Markdown (or plain text). Token-cheap alternative to screenshots or full DOM dumps for reading/understanding a page. Scopes to a CSS selector when given, otherwise auto-detects the main content region.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                format: { type: "string", enum: ["markdown", "text"], description: "Output format. Default markdown." },
+                selector: { type: "string", description: "Optional CSS selector to scope extraction to a region." },
+                includeLinks: { type: "boolean", description: "Render anchors as [text](href) in markdown. Default true." },
+                maxLength: { type: "number", description: "Max characters returned before truncation. Default 20000." }
+            }
+        }
+    },
+    {
+        name: "save_auth_state",
+        description: "SESSION TOOL. Export the current browser session (cookies + localStorage + sessionStorage) to a JSON file so a logged-in session can be reused later with load_auth_state. Avoids repeating logins.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                path: { type: "string", description: "File path to write the auth state JSON. Defaults to <cwd>/.aether/auth-state.json." },
+                origins: { type: "array", items: { type: "string" }, description: "Optional list of origins to capture storage for. Defaults to the current origin." }
+            }
+        }
+    },
+    {
+        name: "load_auth_state",
+        description: "SESSION TOOL. Restore a previously saved session (cookies + localStorage + sessionStorage) from a JSON file written by save_auth_state. Navigate to the target site first, then load, then reload.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                path: { type: "string", description: "File path to read the auth state JSON. Defaults to <cwd>/.aether/auth-state.json." },
+                reload: { type: "boolean", description: "Reload the active tab after restoring so storage takes effect. Default true." }
+            }
+        }
+    },
+    {
         name: "page_snapshot",
         description: "Capture page context optimized for LLM consumption. Lightweight by default; opt into screenshots, cookies, accessibility tree, or full DOM snapshot when needed.",
         inputSchema: {
@@ -1273,6 +1308,33 @@ export function RegisterMcpTools(server: Server, wsServer: any) {
                     content.push({ type: "text", text: `\nInteractive Elements: ${JSON.stringify(result.elements, null, 2)}` });
                 }
                 return { content };
+            }
+
+            if (name === "get_page_text") {
+                const result = await bridge.sendCommand("get_page_text", {
+                    format: a?.format,
+                    selector: a?.selector,
+                    includeLinks: a?.includeLinks,
+                    maxLength: a?.maxLength,
+                });
+                const header = `Title: ${result.title}\nURL: ${result.url}\nFormat: ${result.format} | ${result.length} chars${result.truncated ? " (truncated)" : ""}`;
+                return { content: [{ type: "text", text: `${header}\n\n${result.text}` }] };
+            }
+
+            if (name === "save_auth_state") {
+                const result = await bridge.sendCommand("save_auth_state", {
+                    path: a?.path,
+                    origins: a?.origins,
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
+            }
+
+            if (name === "load_auth_state") {
+                const result = await bridge.sendCommand("load_auth_state", {
+                    path: a?.path,
+                    reload: a?.reload,
+                });
+                return { content: [{ type: "text", text: JSON.stringify(result) }] };
             }
 
             throw new Error(`Unknown tool: ${name}`);

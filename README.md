@@ -71,6 +71,8 @@ No cloning. No building. No absolute paths.
 | **Navigation** | `navigate`, `go_back`, `go_forward`, `reload` |
 | **Interaction** | `click_text`, `click_role`, `click_by_ref`, `fill_label`, `fill_by_selector`, `press_key` |
 | **Inspection** | `snapshot_compact`, `list_interactive_elements`, `get_state`, `page_snapshot` |
+| **Reading** | `get_page_text` (clean Markdown/text extraction — token-cheap page reading) |
+| **Sessions** | `save_auth_state`, `load_auth_state` (reuse a logged-in session, skip repeat logins) |
 | **Debugging** | `get_logs`, `get_network_errors`, `get_performance_metrics` |
 | **Tabs & Windows** | `new_tab`, `list_tabs`, `switch_tab`, `close_tab` |
 | **Advanced** | `screenshot`, `print_pdf`, `mock_network_request`, `set_geolocation`, `emulate_device` |

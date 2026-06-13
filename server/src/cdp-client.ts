@@ -6,6 +6,7 @@ import path from "path";
 import os from "os";
 
 import { STEALTH_SCRIPT } from "./stealth";
+import { SHARED_DOM_HELPERS } from "./element-collector";
 
 interface CdpTarget {
     id: string;
@@ -265,7 +266,8 @@ export class CdpClient {
             expression: `
                 (function() {
                     const withSoM = ${JSON.stringify(withSoM)};
-                    
+                    ${SHARED_DOM_HELPERS}
+
                     // Remove existing overlays
                     const oldContainer = document.getElementById('aether-som-container');
                     if (oldContainer) oldContainer.remove();
@@ -302,11 +304,8 @@ export class CdpClient {
                         let text = el.innerText || el.textContent || '';
                         text = text.trim().substring(0, 100);
                         
-                        // Get selector
-                        let selector = '';
-                        if (el.id) selector = '#' + CSS.escape(el.id);
-                        else if (el.className && typeof el.className === 'string') selector = '.' + el.className.split(' ')[0];
-                        else selector = el.tagName.toLowerCase();
+                        // Get a stable selector (shared with the locator engine)
+                        const selector = aetherStableSelector(el);
                         
                         if (withSoM && container) {
                             const id = String(validIndex);
@@ -342,7 +341,7 @@ export class CdpClient {
                             attributes: {
                                 type: el.getAttribute('type') || '',
                                 href: el.getAttribute('href') || '',
-                                role: el.getAttribute('role') || '',
+                                role: aetherImplicitRole(el),
                                 'aria-label': el.getAttribute('aria-label') || ''
                             }
                         };
