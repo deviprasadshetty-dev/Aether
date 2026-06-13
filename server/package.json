@@ -1,12 +1,21 @@
 {
     "name": "aether-mcp-server",
-    "version": "2.0.0",
+    "version": "2.0.1",
     "description": "Aether MCP Server - AI Browser Controller",
     "main": "dist/index.js",
+    "bin": {
+        "aether-mcp-server": "dist/index.js"
+    },
+    "files": [
+        "dist/",
+        "README.md"
+    ],
     "scripts": {
         "build": "tsc",
+        "postbuild": "node -e \"const f=require('fs');const c=f.readFileSync('dist/index.js','utf8');f.writeFileSync('dist/index.js','#!/usr/bin/env node\\n'+c.replace('#!/usr/bin/env node\\n',''))\"",
         "start": "ts-node src/index.ts",
-        "dev": "nodemon src/index.ts"
+        "dev": "nodemon src/index.ts",
+        "prepublishOnly": "npm run build"
     },
     "keywords": [],
     "author": "",
