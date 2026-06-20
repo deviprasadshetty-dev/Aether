@@ -24,11 +24,12 @@ interface CachedSnapshot {
     elements: LocatorCandidate[];
 }
 
-const CACHE_TTL_MS = 1000;
+const CACHE_TTL_MS = 5000; // 5s — safe because cache auto-invalidates on DOM mutations
 
 export class PageSnapshotCache {
     private version = 0;
     private cached: CachedSnapshot | null = null;
+    private lastUrl = "";
 
     constructor(
         private readonly client: CdpClient,
@@ -40,7 +41,23 @@ export class PageSnapshotCache {
     invalidate(reason: string = "manual"): void {
         this.version++;
         this.cached = null;
-        console.error(`[SnapshotCache] invalidated: ${reason}`);
+    }
+
+    /** Returns true if the cache is fresh enough to serve. */
+    isFresh(): boolean {
+        const c = this.cached;
+        return !!(c && c.version === this.version && (Date.now() - c.createdAt) <= CACHE_TTL_MS);
+    }
+
+    /** Get cache metadata for debugging. */
+    getCacheInfo(): { version: number; ageMs: number; fresh: boolean; url: string } {
+        const c = this.cached;
+        return {
+            version: this.version,
+            ageMs: c ? Date.now() - c.createdAt : Infinity,
+            fresh: this.isFresh(),
+            url: c?.url ?? "",
+        };
     }
 
     async compact(params: { maxElements?: number; includeText?: boolean; withOverlay?: boolean } = {}): Promise<CompactSnapshot> {

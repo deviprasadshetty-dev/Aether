@@ -7,6 +7,7 @@ import os from "os";
 
 import { STEALTH_SCRIPT } from "./stealth";
 import { SHARED_DOM_HELPERS } from "./element-collector";
+import { LOCATOR_BOOTSTRAP_SCRIPT } from "./eval-scripts";
 
 interface CdpTarget {
     id: string;
@@ -56,8 +57,97 @@ export class CdpClient {
     private mousePosition: { x: number; y: number } | null = null;
     private networkLoggingAttached = false;
     private diagnosticsLoggingAttached = false;
+    private speedMultiplier = 1.0;
+    private documentNodeId: number | null = null;
 
     constructor() {}
+
+    /** Set speed multiplier. 0 = instant, 1 = normal, 2 = slow (2x delays). */
+    setSpeed(m: number): void {
+        this.speedMultiplier = Math.max(0, m);
+    }
+
+    /** Get current speed multiplier. */
+    getSpeedMultiplier(): number {
+        return this.speedMultiplier;
+    }
+
+    // ─── CDP DOM-level utilities (3-5x faster than Runtime.evaluate) ───
+
+    /** Invalidate cached document node ID. Call after navigation or tab switch. */
+    invalidateDocumentNodeId(): void {
+        this.documentNodeId = null;
+    }
+
+    /** Get the document root nodeId (cached per page). */
+    async getDocumentNodeId(): Promise<number> {
+        try {
+            if (this.documentNodeId !== null) return this.documentNodeId;
+            const result = await this.sendCommand("DOM.getDocument", { depth: -1, pierce: true });
+            const nodeId = result.root.nodeId as number;
+            this.documentNodeId = nodeId;
+            return nodeId;
+        } catch {
+            return 0; // sentinel — caller should handle
+        }
+    }
+
+    /** Run DOM.querySelector via CDP (no JS injection). Returns nodeId or null. */
+    async querySelectorNodeId(selector: string): Promise<number | null> {
+        try {
+            const docId = await this.getDocumentNodeId();
+            if (!docId) return null;
+            const result = await this.sendCommand("DOM.querySelector", { nodeId: docId, selector });
+            return result.nodeId ?? null;
+        } catch {
+            return null;
+        }
+    }
+
+    /** Get bounding box from the layout engine (no JS injection). Returns null if hidden. */
+    async getBoxModel(nodeId: number): Promise<{ x: number; y: number; width: number; height: number } | null> {
+        try {
+            const result = await this.sendCommand("DOM.getBoxModel", { nodeId });
+            if (!result || !result.model) return null;
+            // quad[0..7] = x1,y1, x2,y2, x3,y3, x4,y4 (corners of content box)
+            // top-left = [quad[0], quad[1]], bottom-right = [quad[4], quad[5]]
+            const q = result.model.content;
+            return {
+                x: q[0],
+                y: q[1],
+                width: q[4] - q[0],
+                height: q[5] - q[1],
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    /** Focus an element via CDP DOM.focus. */
+    async focusNode(nodeId: number): Promise<void> {
+        try {
+            await this.sendCommand("DOM.focus", { nodeId });
+        } catch {
+            // ignore
+        }
+    }
+
+    /** Get the center coordinates of an element matched by selector. */
+    async getElementCenter(selector: string): Promise<{ x: number; y: number; width: number } | null> {
+        try {
+            const nodeId = await this.querySelectorNodeId(selector);
+            if (!nodeId) return null;
+            const box = await this.getBoxModel(nodeId);
+            if (!box) return null;
+            return {
+                x: box.x + box.width / 2,
+                y: box.y + box.height / 2,
+                width: box.width,
+            };
+        } catch {
+            return null;
+        }
+    }
 
     /**
      * Connect to existing Chrome instance on given port
@@ -129,28 +219,25 @@ export class CdpClient {
             this.ws.on("open", async () => {
                 this.connected = true;
                 this.activeTarget = target;
+                this.documentNodeId = null;
                 console.error(`[CDP] Connected to target: ${target.title} (${target.url})`);
                 try {
-                    // Enable core CDP domains
-                    await Promise.all([
-                        this.sendCommand("Page.enable"),
-                        this.sendCommand("Network.enable"),
-                        this.sendCommand("Runtime.enable"),
-                        this.sendCommand("DOM.enable"),
-                        this.sendCommand("Log.enable").catch(() => {}),
-                        this.sendCommand("Animation.enable").catch(() => {}),
-                        this.sendCommand("Page.addScriptToEvaluateOnNewDocument", {
-                            source: STEALTH_SCRIPT
-                        })
-                    ]);
+                    // Enable minimal CDP domains on connect. Everything else is
+                    // lazily enabled by the caller when needed.
+                    await this.sendCommand("Runtime.enable").catch(() => {});
 
-                    // Keep animations running. Pausing them can freeze SPA loaders and leave pages looking blank.
-                    this.sendCommand("Animation.setPlaybackRate", { playbackRate: 1 }).catch(() => {});
+                    // Inject locator bootstrap once so element resolution works.
+                    await this.sendCommand("Page.addScriptToEvaluateOnNewDocument", {
+                        source: LOCATOR_BOOTSTRAP_SCRIPT
+                    });
+
+                    // Stealth script — makes the browser harder to detect as automated.
+                    await this.sendCommand("Page.addScriptToEvaluateOnNewDocument", {
+                        source: STEALTH_SCRIPT
+                    }).catch(() => {});
 
                     this.attachNetworkLogging();
                     this.attachDiagnosticsLogging();
-
-                    console.error("[CDP] Core CDP domains enabled");
                 } catch (e) {
                     console.error("[CDP] Failed to enable core domains:", e);
                 }
@@ -219,6 +306,7 @@ export class CdpClient {
      * Navigate to URL
      */
     async navigate(url: string): Promise<void> {
+        this.documentNodeId = null;
         await this.sendCommand("Page.navigate", { url });
     }
 
@@ -372,63 +460,44 @@ export class CdpClient {
     }
 
     /**
-     * Wait for a selector to appear in DOM
+     * Wait for a selector to appear in DOM — fast CDP polling.
      */
     async waitForSelector(selector: string, timeout: number = 10000, options: WaitForSelectorOptions = {}): Promise<boolean> {
         const startTime = Date.now();
-        let lastBox: any = null;
+        let lastBox: string | null = null;
         let stableSince = 0;
-        
-        while (Date.now() - startTime < timeout) {
-            const result = await this.sendCommand("Runtime.evaluate", {
-                expression: `
-                    (function() {
-                        const el = document.querySelector(${JSON.stringify(selector)});
-                        if (!el) return { found: false };
-                        const rect = el.getBoundingClientRect();
-                        const computed = window.getComputedStyle(el);
-                        const visible = computed.display !== 'none' &&
-                            computed.visibility !== 'hidden' &&
-                            computed.opacity !== '0' &&
-                            rect.width > 0 &&
-                            rect.height > 0;
-                        return {
-                            found: true,
-                            visible,
-                            box: {
-                                x: Math.round(rect.left),
-                                y: Math.round(rect.top),
-                                width: Math.round(rect.width),
-                                height: Math.round(rect.height)
-                            }
-                        };
-                    })()
-                `,
-                returnByValue: true,
-            });
-            
-            const state = result.result?.value;
-            if (state?.found && (!options.visible || state.visible)) {
-                if (!options.stable) return true;
 
-                const box = state.box;
-                const sameBox = lastBox &&
-                    lastBox.x === box.x &&
-                    lastBox.y === box.y &&
-                    lastBox.width === box.width &&
-                    lastBox.height === box.height;
-                if (sameBox) {
+        while (Date.now() - startTime < timeout) {
+            const nodeId = await this.querySelectorNodeId(selector).catch(() => null);
+            if (!nodeId) {
+                await new Promise(r => setTimeout(r, 30));
+                continue;
+            }
+
+            if (!options.visible && !options.stable) return true;
+
+            const box = await this.getBoxModel(nodeId);
+            if (!box || box.width === 0 || box.height === 0) {
+                await new Promise(r => setTimeout(r, 30));
+                continue;
+            }
+
+            if (options.stable) {
+                const boxKey = `${Math.round(box.x)},${Math.round(box.y)},${Math.round(box.width)},${Math.round(box.height)}`;
+                if (lastBox === boxKey) {
                     if (!stableSince) stableSince = Date.now();
                     if (Date.now() - stableSince >= 120) return true;
                 } else {
                     stableSince = 0;
-                    lastBox = box;
+                    lastBox = boxKey;
                 }
+            } else {
+                return true;
             }
-            
-            await new Promise(r => setTimeout(r, 75));
+
+            await new Promise(r => setTimeout(r, 30));
         }
-        
+
         return false;
     }
 
@@ -486,7 +555,7 @@ export class CdpClient {
                 resolve(); // Resolve anyway after timeout
             }, timeout);
             
-            idleCheckInterval = setInterval(checkIdle, 100);
+            idleCheckInterval = setInterval(checkIdle, Math.max(1, 100 * this.speedMultiplier));
             
             this.on("Network.requestWillBeSent", resetIdle);
             this.on("Network.responseReceived", resetIdle);
@@ -599,61 +668,92 @@ export class CdpClient {
         if (!target) {
             throw new Error(`Target not found: ${targetId}`);
         }
+        this.documentNodeId = null;
         await this.attachToTarget(target);
     }
 
     /**
-     * Get a simplified version of the Accessibility Tree for AI agents.
+     * Get a rich Accessibility Tree preserving tree structure, node IDs, and selectors.
+     * AI agents can use this instead of screenshots for most decisions.
      */
-    async getSimplifiedAccessibilityTree(): Promise<any[]> {
+    async getRichAXTree(): Promise<any> {
         await this.sendCommand("Accessibility.enable");
-        const result = await this.sendCommand("Accessibility.getFullAXTree");
+        const result = await this.sendCommand("Accessibility.getFullAXTree", {});
         
-        if (!result || !result.nodes) return [];
-
+        if (!result || !result.nodes) return { tree: null, nodeCount: 0 };
+        
         const nodes = result.nodes;
-        const interactiveNodes: any[] = [];
+        const nodeMap = new Map<number, any>();
         
-        // Map of node IDs for fast lookup
-        const nodeMap = new Map();
-        nodes.forEach((node: any) => nodeMap.set(node.nodeId, node));
-
-        // Helper to get name from node properties
-        const getNodeName = (node: any) => {
-            if (node.name?.value) return node.name.value;
-            const nameProp = node.properties?.find((p: any) => p.name === "name");
-            return nameProp?.value?.value || "";
-        };
-
-        // Filter and simplify nodes
+        // First pass: build lookup
         nodes.forEach((node: any) => {
-            const role = node.role?.value;
-            const name = getNodeName(node);
-            
-            // Only include interactive or meaningful nodes
-            const isInteractive = [
-                "button", "link", "checkbox", "radio", "textbox", "searchbox", 
-                "combobox", "listbox", "menuitem", "slider", "switch", "tab"
-            ].includes(role);
-
-            const hasAction = node.properties?.some((p: any) => 
-                ["pressed", "expanded", "selected", "focused"].includes(p.name)
-            );
-
-            if (isInteractive || (name && name.length > 0 && role !== "generic" && role !== "none")) {
-                interactiveNodes.push({
-                    id: node.nodeId,
-                    role: role,
-                    name: name,
-                    description: node.description?.value || "",
-                    value: node.value?.value || "",
-                    disabled: node.properties?.find((p: any) => p.name === "disabled")?.value?.value || false,
-                    focused: node.properties?.find((p: any) => p.name === "focused")?.value?.value || false,
+            const name = node.name?.value || '';
+            const role = node.role?.value || 'unknown';
+            const properties: Record<string, any> = {};
+            if (node.properties) {
+                node.properties.forEach((p: any) => {
+                    properties[p.name] = p.value?.value ?? p.value;
                 });
             }
+            
+            nodeMap.set(node.nodeId, {
+                axId: node.nodeId,
+                backendDOMNodeId: node.backendDOMNodeId,
+                role,
+                name,
+                description: node.description?.value || '',
+                value: node.value?.value || '',
+                disabled: !!properties.disabled,
+                focused: !!properties.focused,
+                checked: properties.checked,
+                selected: !!properties.selected,
+                expanded: !!properties.expanded,
+                pressed: !!properties.pressed,
+                children: [] as any[],
+            });
         });
+        
+        // Second pass: build tree by following parentIds
+        const roots: any[] = [];
+        nodes.forEach((node: any) => {
+            const enriched = nodeMap.get(node.nodeId);
+            if (!enriched) return;
+            
+            if (node.parentId && nodeMap.has(node.parentId)) {
+                nodeMap.get(node.parentId).children.push(enriched);
+            } else {
+                roots.push(enriched);
+            }
+        });
+        
+        // Prune: remove nodes with no name AND no meaningful role AND no children
+        function prune(node: any): boolean {
+            node.children = node.children.filter(prune);
+            const hasContent = node.name || node.value || 
+                ['button','link','textbox','checkbox','radio','combobox','listbox','heading','alert','dialog','navigation','main','banner','contentinfo','complementary','form','search','table','list','listitem','menu','menuitem','tab','tablist','tabpanel','tree','treeitem','slider','switch','progressbar','img','image'].includes(node.role);
+            return hasContent || node.children.length > 0;
+        }
+        roots.forEach(prune);
+        
+        // Count total nodes after pruning
+        let totalNodes = 0;
+        function count(n: any) { totalNodes++; n.children.forEach(count); }
+        roots.forEach(count);
+        
+        return { tree: roots, nodeCount: totalNodes };
+    }
 
-        return interactiveNodes;
+    /**
+     * Backward-compat: flat list of accessible nodes.
+     * Calls getRichAXTree() and flattens the tree structure.
+     */
+    async getSimplifiedAccessibilityTree(): Promise<any[]> {
+        const result = await this.getRichAXTree();
+        // Flatten for backward compat
+        const flat: any[] = [];
+        function flatten(n: any) { flat.push(n); n.children.forEach(flatten); }
+        (result.tree || []).forEach(flatten);
+        return flat;
     }
 
     async getNetworkTraffic(): Promise<any[]> {
@@ -1101,330 +1201,64 @@ async takeHeapSnapshot(reportProgress?: boolean, treatGlobalObjectsAsRoots?: boo
     await this.sendCommand("HeapProfiler.takeHeapSnapshot", { reportProgress, treatGlobalObjectsAsRoots, captureNumericValue });
 }
 
-    // Simple multi-octave noise function (fractional Brownian motion approximation)
-    private fBm(t: number, octaves: number = 3): number {
-        let value = 0;
-        let amplitude = 1.0;
-        let frequency = 1.0;
-        let maxValue = 0;
-        for (let j = 0; j < octaves; j++) {
-            value += Math.sin(t * frequency * Math.PI * 2 + (j * 12.34)) * amplitude;
-            maxValue += amplitude;
-            amplitude *= 0.5;
-            frequency *= 2.0;
-        }
-        return value / maxValue;
-    }
-
     /**
-     * Click at coordinates with human-like timing, micro-jitter, and optional target width.
+     * Click at coordinates — fast path. Direct CDP dispatch, no Bezier/tremor/jitter.
      */
-    async click(x: number, y: number, button: "left" | "middle" | "right" = "left", targetWidth?: number): Promise<void> {
-        const targetX = Math.round(Number(x));
-        const targetY = Math.round(Number(y));
-        await this.moveMouse(targetX, targetY, targetWidth);
-
-        // Pre-click hover pause — humans don't instantly press after arriving
-        await new Promise((r) => setTimeout(r, 80 + Math.random() * 140));
-
-        // Micro-jitter at the moment of click (hand tremor)
-        const cx = targetX + Math.round((Math.random() - 0.5) * 3);
-        const cy = targetY + Math.round((Math.random() - 0.5) * 3);
-
+    async click(x: number, y: number, button: "left" | "middle" | "right" = "left", _targetWidth?: number): Promise<void> {
+        const rx = Math.round(Number(x));
+        const ry = Math.round(Number(y));
+        this.mousePosition = { x: rx, y: ry };
         await this.sendCommand("Input.dispatchMouseEvent", {
-            type: "mousePressed", x: cx, y: cy, button, clickCount: 1, pointerType: "mouse",
+            type: "mousePressed", x: rx, y: ry, button, clickCount: 1, pointerType: "mouse",
         });
-        // Natural hold duration before release
-        await new Promise((r) => setTimeout(r, 60 + Math.random() * 110));
         await this.sendCommand("Input.dispatchMouseEvent", {
-            type: "mouseReleased", x: cx, y: cy, button, clickCount: 1, pointerType: "mouse",
+            type: "mouseReleased", x: rx, y: ry, button, clickCount: 1, pointerType: "mouse",
         });
     }
 
     /**
-     * Move mouse along a cubic Bezier arc with Fitts's Law duration and fractional Brownian motion tremors.
+     * Move mouse to coordinates — fast path. Single CDP dispatch, no Bezier/tremor interpolation.
      */
-    async moveMouse(x: number, y: number, targetWidth?: number): Promise<void> {
-        const targetX = Math.round(Number(x));
-        const targetY = Math.round(Number(y));
-        const start = this.mousePosition ?? { x: targetX, y: targetY };
-
-        const dist = Math.hypot(targetX - start.x, targetY - start.y);
-        if (dist < 2) {
-            this.mousePosition = { x: targetX, y: targetY };
-            return;
-        }
-
-        // Fitts's Law: MT = a + b * log2(2D / W)
-        const w = targetWidth ?? 30; // default target width to 30px
-        const indexDifficulty = Math.log2(Math.max(1, (2 * dist) / w));
-        const movementTime = 150 + 95 * indexDifficulty; // Fitts's MT in ms
-
-        // Human updates motor position every 10-15ms. Compute dynamic step count.
-        const steps = Math.max(12, Math.min(60, Math.round(movementTime / 12)));
-
-        // Random cubic Bezier control points — creates an organic arc
-        const angle  = Math.atan2(targetY - start.y, targetX - start.x) + Math.PI / 2;
-        const spread = dist * (0.25 + Math.random() * 0.35);
-        const sign   = Math.random() < 0.5 ? 1 : -1;
-
-        const cp1 = {
-            x: start.x + (targetX - start.x) * (0.1 + Math.random() * 0.2) + Math.cos(angle) * spread * sign * (0.3 + Math.random() * 0.7),
-            y: start.y + (targetY - start.y) * (0.1 + Math.random() * 0.2) + Math.sin(angle) * spread * sign * (0.3 + Math.random() * 0.7),
-        };
-        const cp2 = {
-            x: start.x + (targetX - start.x) * (0.7 + Math.random() * 0.2) + Math.cos(angle) * spread * sign * (0.05 + Math.random() * 0.35),
-            y: start.y + (targetY - start.y) * (0.7 + Math.random() * 0.2) + Math.sin(angle) * spread * sign * (0.05 + Math.random() * 0.35),
-        };
-
-        await this.updateMouseOverlay(start.x, start.y).catch(() => {});
-
-        // Unique noise seed for this movement path
-        const seedX = Math.random() * 100;
-        const seedY = Math.random() * 100;
-
-        for (let i = 1; i <= steps; i++) {
-            const t = i / steps;
-            // Ease-in-out: slow start, fast middle, slow near target
-            const e = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
-            const u = 1 - e;
-            const px = u*u*u*start.x + 3*u*u*e*cp1.x + 3*u*e*e*cp2.x + e*e*e*targetX;
-            const py = u*u*u*start.y + 3*u*u*e*cp1.y + 3*u*e*e*cp2.y + e*e*e*targetY;
-
-            // fractional Brownian motion noise walk (muscle tremor)
-            const tremorAmplitude = 1.2;
-            const noiseX = this.fBm(t * 8 + seedX, 3) * tremorAmplitude;
-            const noiseY = this.fBm(t * 8 + seedY, 3) * tremorAmplitude;
-
-            const cx = Math.round(px + noiseX);
-            const cy = Math.round(py + noiseY);
-
-            await this.sendCommand("Input.dispatchMouseEvent", {
-                type: "mouseMoved", x: cx, y: cy, button: "none", pointerType: "mouse",
-            });
-            await this.updateMouseOverlay(cx, cy).catch(() => {});
-
-            // Velocity profile delay: faster in the middle, slower at start/end
-            const velocityWeight = Math.sin(t * Math.PI); // bell curve 0 -> 1 -> 0
-            const stepDelay = 2 + (1 - velocityWeight) * 12 + Math.random() * 4;
-
-            await new Promise((r) => setTimeout(r, stepDelay));
-        }
-
-        this.mousePosition = { x: targetX, y: targetY };
+    async moveMouse(x: number, y: number, _targetWidth?: number): Promise<void> {
+        const rx = Math.round(Number(x));
+        const ry = Math.round(Number(y));
+        this.mousePosition = { x: rx, y: ry };
+        await this.sendCommand("Input.dispatchMouseEvent", {
+            type: "mouseMoved", x: rx, y: ry, button: "none", pointerType: "mouse",
+        });
     }
 
     getMousePosition(): { x: number; y: number } {
         return this.mousePosition ?? { x: 300, y: 300 };
     }
 
-    private async updateMouseOverlay(x: number, y: number): Promise<void> {
-        await this.sendCommand("Runtime.evaluate", {
-            expression: `
-                (function() {
-                    const x = ${JSON.stringify(Math.round(x))};
-                    const y = ${JSON.stringify(Math.round(y))};
-                    let cursor = document.getElementById('__aether_mouse_cursor');
-                    if (!cursor) {
-                        cursor = document.createElement('div');
-                        cursor.id = '__aether_mouse_cursor';
-                        cursor.setAttribute('aria-hidden', 'true');
-                        cursor.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" style="display:block"><path d="M20.5056 10.7754C21.1225 10.5355 21.431 10.4155 21.5176 10.2459C21.5926 10.099 21.5903 9.92446 21.5115 9.77954C21.4205 9.61226 21.109 9.50044 20.486 9.2768L4.59629 3.5728C4.0866 3.38983 3.83175 3.29835 3.66514 3.35605C3.52029 3.40621 3.40645 3.52004 3.35629 3.6649C3.29859 3.8315 3.39008 4.08635 3.57304 4.59605L9.277 20.4858C9.50064 21.1088 9.61246 21.4203 9.77973 21.5113C9.92465 21.5901 10.0991 21.5924 10.2461 21.5174C10.4157 21.4308 10.5356 21.1223 10.7756 20.5054L13.3724 13.8278C13.4194 13.707 13.4429 13.6466 13.4792 13.5957C13.5114 13.5506 13.5508 13.5112 13.5959 13.479C13.6468 13.4427 13.7072 13.4192 13.828 13.3722L20.5056 10.7754Z" stroke="#111111" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M20.5056 10.7754C21.1225 10.5355 21.431 10.4155 21.5176 10.2459C21.5926 10.099 21.5903 9.92446 21.5115 9.77954C21.4205 9.61226 21.109 9.50044 20.486 9.2768L4.59629 3.5728C4.0866 3.38983 3.83175 3.29835 3.66514 3.35605C3.52029 3.40621 3.40645 3.52004 3.35629 3.6649C3.29859 3.8315 3.39008 4.08635 3.57304 4.59605L9.277 20.4858C9.50064 21.1088 9.61246 21.4203 9.77973 21.5113C9.92465 21.5901 10.0991 21.5924 10.2461 21.5174C10.4157 21.4308 10.5356 21.1223 10.7756 20.5054L13.3724 13.8278C13.4194 13.707 13.4429 13.6466 13.4792 13.5957C13.5114 13.5506 13.5508 13.5112 13.5959 13.479C13.6468 13.4427 13.7072 13.4192 13.828 13.3722L20.5056 10.7754Z" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-                        cursor.style.cssText = [
-                            'position: fixed',
-                            'left: 0',
-                            'top: 0',
-                            'transform: translate(-3px, -3px)',
-                            'transition: left 70ms linear, top 70ms linear, opacity 120ms ease',
-                            'z-index: 2147483647',
-                            'pointer-events: none',
-                            'opacity: 1'
-                        ].join(';');
-                        document.documentElement.appendChild(cursor);
-                    }
-                    cursor.style.left = x + 'px';
-                    cursor.style.top = y + 'px';
-                    cursor.style.opacity = '1';
-                    clearTimeout(window.__aetherMouseCursorTimer);
-                    window.__aetherMouseCursorTimer = setTimeout(() => {
-                        const current = document.getElementById('__aether_mouse_cursor');
-                        if (current) current.style.opacity = '0.55';
-                    }, 900);
-                    return true;
-                })()
-            `,
-            returnByValue: true,
-        });
-    }
-
-    private async showScrollIndicator(x: number, y: number, deltaY: number): Promise<void> {
-        const isDown = deltaY > 0;
-        const chevron = (dy: number, opacity: number) => {
-            const d = isDown
-                ? `M10,${dy} L16,${dy + 7} L22,${dy}`
-                : `M10,${dy + 7} L16,${dy} L22,${dy + 7}`;
-            return `<path d="${d}" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="${opacity}"/>`;
-        };
-        const chevrons = isDown
-            ? chevron(4, 0.3) + chevron(15, 0.65) + chevron(26, 1)
-            : chevron(26, 0.3) + chevron(15, 0.65) + chevron(4, 1);
-        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="36" style="display:block">${chevrons}</svg>`;
-
-        await this.sendCommand("Runtime.evaluate", {
-            expression: `
-                (function() {
-                    var ind = document.getElementById('__aether_scroll_ind');
-                    if (ind) ind.remove();
-                    ind = document.createElement('div');
-                    ind.id = '__aether_scroll_ind';
-                    ind.innerHTML = ${JSON.stringify(svg)};
-                    ind.style.cssText = [
-                        'position: fixed',
-                        'left: ${Math.round(x)}px',
-                        'top: ${Math.round(y)}px',
-                        'transform: translate(-50%, -50%)',
-                        'background: rgba(0,0,0,0.52)',
-                        'border-radius: 20px',
-                        'padding: 6px 8px',
-                        'z-index: 2147483647',
-                        'pointer-events: none',
-                        'opacity: 1',
-                        'transition: opacity 300ms ease'
-                    ].join(';');
-                    document.documentElement.appendChild(ind);
-                    clearTimeout(window.__aetherScrollTimer);
-                    window.__aetherScrollTimer = setTimeout(function() {
-                        var cur = document.getElementById('__aether_scroll_ind');
-                        if (cur) {
-                            cur.style.opacity = '0';
-                            setTimeout(function() { if (cur.parentNode) cur.parentNode.removeChild(cur); }, 320);
-                        }
-                    }, 500);
-                    return true;
-                })()
-            `,
-            returnByValue: true,
-        }).catch(() => {});
-    }
-
     async moveMouseToSelector(selector: string): Promise<boolean> {
-        const result = await this.evaluate(`
-            (function() {
-                const el = document.querySelector(${JSON.stringify(selector)});
-                if (!el) return null;
-                el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-                const r = el.getBoundingClientRect();
-                if (r.width === 0 || r.height === 0) return null;
-                return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
-            })()
-        `);
-        if (!result) return false;
-        await this.moveMouse(result.x, result.y);
-        return true;
-    }
-
-    /**
-     * Scroll from the current or supplied pointer location using wheel events.
-     */
-    async wheel(deltaX: number, deltaY: number, x?: number, y?: number): Promise<void> {
-        const origin = {
-            x: Number(x ?? this.mousePosition?.x ?? 0),
-            y: Number(y ?? this.mousePosition?.y ?? 0),
-        };
-        await this.moveMouse(origin.x, origin.y);
-        const dominant = Math.abs(Number(deltaY)) >= Math.abs(Number(deltaX)) ? Number(deltaY) : Number(deltaX);
-        if (dominant !== 0) await this.showScrollIndicator(origin.x, origin.y, dominant);
-
-        // Break scroll into irregular chunks — humans don't scroll at perfectly uniform speed
-        const totalY = Number(deltaY);
-        const totalX = Number(deltaX);
-        const totalAbs = Math.max(Math.abs(totalX), Math.abs(totalY));
-        const steps = Math.max(1, Math.ceil(totalAbs / (300 + Math.random() * 400)));
-
-        let sentY = 0;
-        let sentX = 0;
-        for (let step = 0; step < steps; step++) {
-            const last = step === steps - 1;
-            // Random chunk size with slight ease-in (start slow, then momentum)
-            const fraction = last ? 1 : (0.5 + Math.random() * 0.5) / (steps - step);
-            const chunkY = last ? totalY - sentY : Math.round(totalY * fraction);
-            const chunkX = last ? totalX - sentX : Math.round(totalX * fraction);
-            sentY += chunkY;
-            sentX += chunkX;
-
-            await this.sendCommand("Input.dispatchMouseWheel", {
-                x: origin.x, y: origin.y, deltaX: chunkX, deltaY: chunkY,
-            });
-
-            if (!last) {
-                await new Promise((r) => setTimeout(r, 40 + Math.random() * 80));
-            }
+        try {
+            const center = await this.getElementCenter(selector);
+            if (!center) return false;
+            await this.moveMouse(center.x, center.y);
+            return true;
+        } catch {
+            return false;
         }
     }
 
+    /**
+     * Scroll from the current or supplied pointer location — fast path. Single wheel event.
+     */
+    async wheel(deltaX: number, deltaY: number, x?: number, y?: number): Promise<void> {
+        const ox = Math.round(Number(x ?? this.mousePosition?.x ?? 0));
+        const oy = Math.round(Number(y ?? this.mousePosition?.y ?? 0));
+        this.mousePosition = { x: ox, y: oy };
+        await this.sendCommand("Input.dispatchMouseWheel", {
+            x: ox, y: oy, deltaX: Math.round(Number(deltaX)), deltaY: Math.round(Number(deltaY)),
+        });
+    }
+
     async typeText(text: string): Promise<void> {
-        const ADJACENT_KEYS: Record<string, string> = {
-            'a': 'qwsz',
-            'b': 'vghn',
-            'c': 'xdfv',
-            'd': 'ersfxc',
-            'e': 'wsdr',
-            'f': 'rtgvcd',
-            'g': 'tyhbvf',
-            'h': 'yujnbg',
-            'i': 'ujko',
-            'j': 'uikmnh',
-            'k': 'ijlm',
-            'l': 'okp',
-            'm': 'njk',
-            'n': 'bhjm',
-            'o': 'iklp',
-            'p': 'ol',
-            'q': 'wa',
-            'r': 'edft',
-            's': 'wedxza',
-            't': 'rfgy',
-            'u': 'yhji',
-            'v': 'cfgb',
-            'w': 'qase',
-            'x': 'zsdc',
-            'y': 'tghu',
-            'z': 'asx',
-        };
-
-        for (let i = 0; i < text.length; i++) {
-            const ch = text[i];
-            const lowerCh = ch.toLowerCase();
-
-            // ~1.5% chance of typo on lowercase QWERTY letters
-            if (ADJACENT_KEYS[lowerCh] && Math.random() < 0.015) {
-                const adjList = ADJACENT_KEYS[lowerCh];
-                const typoCh = adjList[Math.floor(Math.random() * adjList.length)];
-                const resolvedTypo = ch === ch.toUpperCase() ? typoCh.toUpperCase() : typoCh;
-
-                // Type the typo first
-                await this.sendCommand("Input.insertText", { text: resolvedTypo });
-                // Natural pause for reaction time before correcting
-                await new Promise((r) => setTimeout(r, 120 + Math.random() * 150));
-                // Delete typo
-                await this.pressKey("Backspace");
-                // Short typing recovery pause
-                await new Promise((r) => setTimeout(r, 80 + Math.random() * 100));
-            }
-
-            await this.sendCommand("Input.insertText", { text: ch });
-
-            // Base inter-key delay (~55-90 WPM range)
-            let delay = 35 + Math.random() * 75;
-
-            // Longer pause after spaces (word boundary) and punctuation
-            if (ch === " ")               delay += 15 + Math.random() * 55;
-            if (/[.,!?;:\n]/.test(ch))    delay += 60 + Math.random() * 110;
-
-            // ~3% chance of a "thinking" pause mid-sentence
-            if (Math.random() < 0.03)     delay += 250 + Math.random() * 600;
-
-            await new Promise((r) => setTimeout(r, delay));
+        // Fast path — insert entire text in one CDP call, no per-character delays or typo simulation.
+        if (text) {
+            await this.sendCommand("Input.insertText", { text });
         }
     }
 

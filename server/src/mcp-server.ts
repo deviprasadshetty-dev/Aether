@@ -720,7 +720,7 @@ const Tools = [
     }
 ];
 
-export function RegisterMcpTools(server: Server, wsServer: any) {
+export function RegisterMcpTools(server: Server, wsServer?: any) {
     server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: Tools }));
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {

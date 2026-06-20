@@ -1,5 +1,4 @@
 import { CdpClient } from "./cdp-client";
-import { SHARED_DOM_HELPERS } from "./element-collector";
 
 export interface LocatorCandidate {
     ref: string;
@@ -52,16 +51,14 @@ export class LocatorEngine {
 
     async list(maxElements: number = 50, includeText: boolean = true, withOverlay: boolean = false): Promise<LocatorCandidate[]> {
         const capped = Math.max(0, Math.min(Number(maxElements || 50), 200));
-        const result = await this.client.evaluate(locatorScript({
-            target: "",
-            role: "",
-            selector: "",
-            maxCandidates: capped,
-            includeText,
-            mode: "list",
-        }));
-
-        const candidates = normalizeCandidates(result?.candidates).slice(0, capped);
+        const result = await this.client.evaluate(
+            `window.__aetherLocate(${JSON.stringify(JSON.stringify({
+                target: "", role: "", selector: "",
+                maxCandidates: capped, includeText, mode: "list",
+            }))})`
+        );
+        const parsed = safeJsonParse(result);
+        const candidates = normalizeCandidates(parsed?.candidates).slice(0, capped);
         if (withOverlay && candidates.length > 0) {
             await this.client.getInteractiveElements(true).catch(() => ({ elements: [], somInjected: false }));
         }
@@ -81,14 +78,13 @@ export class LocatorEngine {
         }
 
         while (Date.now() - started < timeout) {
-            const result = await this.client.evaluate(locatorScript({
-                target,
-                role,
-                selector,
-                maxCandidates,
-                includeText: true,
-                mode: "resolve",
-            })).catch((error: any) => ({ error: error.message }));
+            const resultJson = await this.client.evaluate(
+                `window.__aetherLocate(${JSON.stringify(JSON.stringify({
+                    target, role, selector: selector,
+                    maxCandidates, includeText: true, mode: "resolve",
+                }))})`
+            ).catch((error: any) => ({ error: error.message }));
+            const result = safeJsonParse(resultJson);
 
             const candidates = normalizeCandidates(result?.candidates);
             const best = candidates[0];
@@ -134,180 +130,9 @@ function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function locatorScript(input: {
-    target: string;
-    role: string;
-    selector: string;
-    maxCandidates: number;
-    includeText: boolean;
-    mode: "list" | "resolve";
-}): string {
-    return `
-        (function() {
-            const target = ${JSON.stringify(input.target)};
-            const targetLower = target.toLowerCase();
-            const roleHint = ${JSON.stringify(input.role)};
-            const selectorHint = ${JSON.stringify(input.selector)};
-            const maxCandidates = ${JSON.stringify(input.maxCandidates)};
-            const includeText = ${JSON.stringify(input.includeText)};
-            const mode = ${JSON.stringify(input.mode)};
-            const interactiveSelector = [
-                'a[href]', 'button', 'input:not([type="hidden"])', 'select', 'textarea',
-                '[onclick]', '[role]', '[tabindex]:not([tabindex="-1"])', 'label', 'summary',
-                '[contenteditable="true"]', '[aria-label]', '[placeholder]'
-            ].join(', ');
-
-            ${SHARED_DOM_HELPERS}
-
-            // Thin aliases so the rest of this resolver reads naturally while the
-            // implementations stay shared with every other collector.
-            const norm = aetherNorm;
-            const visible = aetherVisible;
-            const cssPath = aetherStableSelector;
-            const inferRole = aetherImplicitRole;
-            const labelFor = aetherLabelFor;
-            const textFor = aetherAccessibleName;
-
-            function xpath(el) {
-                const parts = [];
-                let node = el;
-                while (node && node.nodeType === Node.ELEMENT_NODE) {
-                    let index = 1;
-                    let sibling = node.previousElementSibling;
-                    while (sibling) {
-                        if (sibling.nodeName === node.nodeName) index++;
-                        sibling = sibling.previousElementSibling;
-                    }
-                    parts.unshift(node.nodeName.toLowerCase() + '[' + index + ']');
-                    node = node.parentElement;
-                }
-                return '/' + parts.join('/');
-            }
-
-            function scoreField(field, value, exact, includes) {
-                const text = norm(value);
-                const lower = text.toLowerCase();
-                if (!targetLower) return { score: 0, by: '' };
-                if (lower === targetLower) return { score: exact, by: field + ':exact' };
-                if (lower.includes(targetLower)) return { score: includes, by: field + ':contains' };
-                if (targetLower.includes(lower) && lower.length >= 3) return { score: Math.max(1, includes - 1), by: field + ':contained_by_target' };
-                return { score: 0, by: '' };
-            }
-
-            function scoreCandidate(item) {
-                let score = 0;
-                let matchedBy = '';
-                const fields = [
-                    ['selector', item.selector, 13, 10],
-                    ['xpath', item.xpath, 11, 8],
-                    ['name', item.name, 12, 10],
-                    ['label', item.label, 12, 10],
-                    ['placeholder', item.placeholder, 11, 9],
-                    ['text', item.text, 10, 8],
-                    ['title', item.title, 8, 6],
-                    ['value', item.value, 7, 5]
-                ];
-                for (const field of fields) {
-                    const match = scoreField(field[0], field[1], field[2], field[3]);
-                    if (match.score > score) {
-                        score = match.score;
-                        matchedBy = match.by;
-                    }
-                }
-                if (roleHint) {
-                    if (item.role === roleHint) score += 5;
-                    else if (roleHint === 'textbox' && ['input', 'textarea'].includes(item.tag)) score += 3;
-                    else score -= 3;
-                }
-                if (!targetLower && roleHint && item.role === roleHint) {
-                    matchedBy = 'role';
-                    score = Math.max(score, 5);
-                }
-                if (item.scope !== 'document') score += 1;
-                item.score = score;
-                item.matchedBy = matchedBy || (selectorHint ? 'selector' : '');
-                return item;
-            }
-
-            function collectFromRoot(root, framePath, frameOffset, shadowDepth, scope, out) {
-                let nodes = [];
-                try {
-                    if (selectorHint) {
-                        nodes = Array.from(root.querySelectorAll(selectorHint));
-                    } else {
-                        nodes = Array.from(root.querySelectorAll(interactiveSelector));
-                    }
-                } catch {
-                    nodes = [];
-                }
-
-                for (const el of nodes) {
-                    if (!visible(el)) continue;
-                    const rect = el.getBoundingClientRect();
-                    const selector = cssPath(el);
-                    const role = inferRole(el);
-                    const label = labelFor(el);
-                    const item = {
-                        ref: '',
-                        selector,
-                        xpath: xpath(el),
-                        scope,
-                        framePath: framePath.slice(),
-                        shadowDepth,
-                        tag: el.tagName.toLowerCase(),
-                        role,
-                        type: el.getAttribute('type') || '',
-                        name: norm(el.getAttribute('aria-label') || label || textFor(el) || el.getAttribute('name')),
-                        text: includeText ? norm(el.innerText || el.textContent).substring(0, 180) : '',
-                        label,
-                        placeholder: norm(el.getAttribute('placeholder')),
-                        title: norm(el.getAttribute('title')),
-                        value: norm(el.getAttribute('value')),
-                        score: 0,
-                        matchedBy: '',
-                        bounds: {
-                            x: Math.round(frameOffset.x + rect.left),
-                            y: Math.round(frameOffset.y + rect.top),
-                            width: Math.round(rect.width),
-                            height: Math.round(rect.height)
-                        }
-                    };
-                    item.ref = item.scope === 'document' && item.framePath.length === 0 && item.shadowDepth === 0
-                        ? 'css:' + item.selector
-                        : 'point:' + Math.round(item.bounds.x + item.bounds.width / 2) + ',' + Math.round(item.bounds.y + item.bounds.height / 2);
-                    out.push(scoreCandidate(item));
-                }
-
-                const all = [];
-                try {
-                    all.push(...Array.from(root.querySelectorAll('*')));
-                } catch {}
-
-                for (const el of all) {
-                    if (el.shadowRoot) {
-                        collectFromRoot(el.shadowRoot, framePath, frameOffset, shadowDepth + 1, 'shadow', out);
-                    }
-                    if (el.tagName && el.tagName.toLowerCase() === 'iframe') {
-                        try {
-                            const doc = el.contentDocument;
-                            if (!doc) continue;
-                            const rect = el.getBoundingClientRect();
-                            collectFromRoot(doc, framePath.concat([Array.from(el.ownerDocument.querySelectorAll('iframe')).indexOf(el)]), {
-                                x: frameOffset.x + rect.left,
-                                y: frameOffset.y + rect.top
-                            }, shadowDepth, 'frame', out);
-                        } catch {}
-                    }
-                }
-            }
-
-            const candidates = [];
-            collectFromRoot(document, [], { x: 0, y: 0 }, 0, 'document', candidates);
-            candidates.sort((a, b) => {
-                if (mode === 'list') return (a.bounds.y - b.bounds.y) || (a.bounds.x - b.bounds.x);
-                return b.score - a.score || a.bounds.y - b.bounds.y || a.bounds.x - b.bounds.x;
-            });
-            return { candidates: candidates.slice(0, maxCandidates) };
-        })()
-    `;
+function safeJsonParse(value: unknown): any {
+    if (typeof value === "string") {
+        try { return JSON.parse(value); } catch { return null; }
+    }
+    return value;
 }

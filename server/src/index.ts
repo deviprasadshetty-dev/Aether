@@ -1,18 +1,17 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { StartWebSocketServer, ensurePortAvailable } from "./ws-server";
 import { RegisterMcpTools } from "./mcp-server";
 import { getCdpClient } from "./cdp-client";
+import { createLogger } from "./logger";
 
-const WS_PORT = 3009;
-const MODE = process.env.AETHER_MODE || "cdp"; // "cdp" or "extension"
+const log = createLogger("index");
 
 // Graceful shutdown handler
 async function shutdown() {
-    console.error("\n[Server] Shutting down...");
+    log.info("Shutting down...");
     const client = getCdpClient();
     if (client.isConnected()) {
-        console.error("[Server] Killing browser...");
+        log.info("Killing browser...");
         await client.killBrowser();
     }
     process.exit(0);
@@ -22,11 +21,11 @@ async function shutdown() {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 process.on("uncaughtException", (err) => {
-    console.error("[Server] Uncaught Exception:", err);
+    log.error("Uncaught Exception", { error: String(err) });
     shutdown();
 });
 process.on("unhandledRejection", (reason, promise) => {
-    console.error("[Server] Unhandled Rejection at:", promise, "reason:", reason);
+    log.error("Unhandled Rejection", { reason: String(reason) });
     shutdown();
 });
 process.on("exit", () => {
@@ -37,27 +36,14 @@ process.on("exit", () => {
 });
 
 async function main() {
-    console.error(`Starting MCP Browser Server (mode: ${MODE})...`);
+    log.info("Starting Aether MCP Browser Server (CDP mode — no extension needed)...");
+    log.info("Use 'launch_browser' or 'connect_browser' tool to connect to a browser.");
 
-    let wsServer: any = null;
-
-    if (MODE === "extension") {
-        // 1. Kill any stale server on the port
-        await ensurePortAvailable(WS_PORT);
-
-        // 2. Start WebSocket Server for Extension
-        wsServer = StartWebSocketServer(WS_PORT);
-        console.error("WebSocket server started for extension mode");
-    } else {
-        console.error("CDP mode enabled - no extension needed");
-        console.error("To connect to a browser, use the 'launch_browser' or 'connect_browser' tool");
-    }
-
-    // 3. Initialize MCP Server
+    // Initialize MCP Server
     const server = new Server(
         {
-            name: "mcp-browser-control",
-            version: "2.0.0",
+            name: "aether-mcp-server",
+            version: "2.1.0",
         },
         {
             capabilities: {
@@ -66,16 +52,16 @@ async function main() {
         }
     );
 
-    // 4. Register Tools
-    RegisterMcpTools(server, wsServer);
+    // Register Tools
+    RegisterMcpTools(server);
 
-    // 5. Connect Transport
+    // Connect Transport
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error("MCP Server connected via Stdio");
+    log.info("MCP Server connected via Stdio. Ready.");
 }
 
 main().catch((err) => {
-    console.error("Fatal Error:", err);
+    log.error("Fatal Error", { error: String(err) });
     process.exit(1);
 });
